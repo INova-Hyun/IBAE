@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "IBAE"
+version = "0.1.0"
+description = "Interactive VLBI jet opening-angle analysis tools"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "opencv-python",
+    "PyQt5",
+    "scikit-image",
+    "scipy",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.setuptools]
+packages = [
+    "IBAE",
+    "IBAE.common",
+    "IBAE.contours",
+    "IBAE.flux",
+    "IBAE.legacy",
+    "IBAE.reports",
+    "IBAE.ridgeline",
+]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+"IBAE" = "."
+"IBAE.common" = "common"
+"IBAE.contours" = "contours"
+"IBAE.flux" = "flux"
+"IBAE.legacy" = "legacy"
+"IBAE.reports" = "reports"
+"IBAE.ridgeline" = "ridgeline"
