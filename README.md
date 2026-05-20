@@ -84,4 +84,5 @@ Generated MOJAVE outputs should be written outside git-tracked data folders or u
 
 - IBAE FWHM Gaussian measurements now use a fixed reconstructed-background baseline of `0.0` by default.
 - The old bounded L1/noise Gaussian baseline path remains available through `IBAE.legacy`.
+- Flux reconstruction keeps the existing log-linear interpolation between `L1` and higher contour levels, and applies the new Gaussian fade only across the `L0-L1` transition. Older saved reconstructions without this metadata are loaded as the legacy flat-`L0` mode.
 - The default ridgeline extraction path uses the MOJAVE-style polar sampler; the previous cost-path extractor remains available as a legacy mode.

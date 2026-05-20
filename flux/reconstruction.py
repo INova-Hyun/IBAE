@@ -15,6 +15,9 @@ def reconstruct_flux_from_levels(
     smooth_sigma_px: float,
     contour_values: Optional[Sequence[float]] = None,
     include_target_flux_map: bool = True,
+    l0_l1_transition_mode: str = "gaussian",
+    l0_l1_transition_width_px: Optional[float] = None,
+    l0_l1_transition_alpha: float = 3.0,
 ) -> Dict[str, object]:
     depth = np.asarray(region_depth_map, dtype=np.int32)
     valid = np.asarray(roi_mask, dtype=np.uint8) > 0
@@ -27,6 +30,13 @@ def reconstruct_flux_from_levels(
             "min_flux": float(background_flux),
             "max_flux": float(background_flux),
             "value_range": (float(background_flux), float(background_flux)),
+            "l0_l1_transition": {
+                "mode": _normalize_l0_l1_transition_mode(l0_l1_transition_mode),
+                "width_px": float("nan"),
+                "width_source": "empty_valid_mask",
+                "alpha": float(l0_l1_transition_alpha),
+                "applied_pixel_count": 0,
+            },
         }
         if bool(include_target_flux_map):
             result["target_flux_map"] = flux.copy()
@@ -107,6 +117,17 @@ def reconstruct_flux_from_levels(
             else:
                 flux[comp] = np.float32(flux_outer)
 
+    l0_l1_transition = _apply_l0_l1_gaussian_transition(
+        flux,
+        depth,
+        valid,
+        background_flux=float(background_flux),
+        l1_flux=_level_flux_value(1, float(l1_flux), ratio, contour_values_arr),
+        smooth_sigma_px=float(smooth_sigma_px),
+        mode=str(l0_l1_transition_mode),
+        width_px=l0_l1_transition_width_px,
+        alpha=float(l0_l1_transition_alpha),
+    )
     smoothed = _smooth_inside_level_components(
         flux,
         depth,
@@ -128,10 +149,178 @@ def reconstruct_flux_from_levels(
         "max_flux": float(max_flux),
         "value_range": (float(min_flux), float(max_flux)),
         "contour_values": None if contour_values_arr is None else contour_values_arr.astype(np.float32),
+        "l0_l1_transition": dict(l0_l1_transition),
     }
     if bool(include_target_flux_map):
         result["target_flux_map"] = np.asarray(flux, dtype=np.float32)
     return result
+
+
+def _normalize_l0_l1_transition_mode(mode: str) -> str:
+    mode_norm = str(mode or "gaussian").strip().lower()
+    if mode_norm in ("gaussian", "gaussian_fade", "truncated_gaussian", "fade"):
+        return "gaussian"
+    if mode_norm in ("flat", "none", "off", "disabled", "legacy"):
+        return "flat"
+    return "gaussian"
+
+
+def _positive_float_or_nan(value: Optional[float]) -> float:
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except Exception:
+        return float("nan")
+    return out if np.isfinite(out) and out > 0.0 else float("nan")
+
+
+def _resolve_l0_l1_transition_width_px(
+    depth: np.ndarray,
+    valid: np.ndarray,
+    requested_width_px: Optional[float],
+    smooth_sigma_px: float,
+) -> Tuple[float, str]:
+    requested = _positive_float_or_nan(requested_width_px)
+    if np.isfinite(requested):
+        return float(requested), "requested"
+
+    spacing = _median_l1_l2_spacing_px(depth, valid)
+    if np.isfinite(spacing) and spacing > 0.0:
+        return float(max(1.0, spacing)), "median_l1_l2_spacing"
+
+    sigma = _positive_float_or_nan(smooth_sigma_px)
+    if np.isfinite(sigma):
+        return float(max(1.0, 2.0 * sigma)), "smooth_sigma_x2_fallback"
+    return 1.0, "fallback_1px"
+
+
+def _median_l1_l2_spacing_px(depth_map: np.ndarray, valid_mask: np.ndarray) -> float:
+    depth = np.asarray(depth_map, dtype=np.int32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    level_mask = (depth == 1) & valid
+    if not np.any(level_mask):
+        return float("nan")
+    outer_region_mask = valid & (depth == 0)
+    inner_region_mask = valid & (depth == 2)
+    if not np.any(outer_region_mask) or not np.any(inner_region_mask):
+        return float("nan")
+
+    values = []
+    comp_count, comp_labels = cv2.connectedComponents(level_mask.astype(np.uint8), connectivity=8)
+    for comp_id in range(1, int(comp_count)):
+        comp = comp_labels == comp_id
+        if not np.any(comp):
+            continue
+        outer_boundary = _boundary_pixels_inside_component(comp, outer_region_mask)
+        inner_boundary = _boundary_pixels_inside_component(comp, inner_region_mask)
+        if not np.any(outer_boundary) or not np.any(inner_boundary):
+            continue
+        outer_dist = _distance_to_boundary(outer_boundary, comp)
+        inner_dist = _distance_to_boundary(inner_boundary, comp)
+        spacing = outer_dist + inner_dist
+        finite = spacing[comp & np.isfinite(spacing) & (spacing > 0.0)]
+        if finite.size > 0:
+            values.append(finite.astype(np.float32, copy=False))
+    if not values:
+        return float("nan")
+    all_values = np.concatenate(values)
+    if all_values.size <= 0:
+        return float("nan")
+    return float(np.nanmedian(all_values))
+
+
+def _truncated_gaussian_fade_values(
+    background_flux: float,
+    l1_flux: float,
+    distance_px: np.ndarray,
+    width_px: float,
+    alpha: float,
+) -> np.ndarray:
+    width = float(max(1e-6, width_px))
+    alpha = float(max(1e-6, alpha))
+    t = np.clip(np.asarray(distance_px, dtype=np.float32) / width, 0.0, 1.0)
+    eps = float(np.exp(-0.5 * alpha * alpha))
+    denom = max(1e-12, 1.0 - eps)
+    fade = (np.exp(-0.5 * np.square(alpha * t)).astype(np.float32) - eps) / denom
+    fade = np.clip(fade, 0.0, 1.0)
+    return (float(background_flux) + ((float(l1_flux) - float(background_flux)) * fade)).astype(np.float32)
+
+
+def _apply_l0_l1_gaussian_transition(
+    flux_map: np.ndarray,
+    depth_map: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    background_flux: float,
+    l1_flux: float,
+    smooth_sigma_px: float,
+    mode: str,
+    width_px: Optional[float],
+    alpha: float,
+) -> Dict[str, object]:
+    mode_norm = _normalize_l0_l1_transition_mode(mode)
+    info: Dict[str, object] = {
+        "mode": mode_norm,
+        "width_px": float("nan"),
+        "width_source": "disabled" if mode_norm == "flat" else "not_applied",
+        "alpha": float(alpha),
+        "applied_pixel_count": 0,
+    }
+    if mode_norm == "flat":
+        return info
+
+    flux = np.asarray(flux_map, dtype=np.float32)
+    depth = np.asarray(depth_map, dtype=np.int32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    outer_mask = valid & (depth == 0)
+    l1_mask = valid & (depth == 1)
+    if not np.any(outer_mask) or not np.any(l1_mask):
+        info["width_source"] = "missing_l0_or_l1"
+        return info
+    if not (np.isfinite(float(background_flux)) and np.isfinite(float(l1_flux))):
+        info["width_source"] = "invalid_flux"
+        return info
+
+    resolved_width, width_source = _resolve_l0_l1_transition_width_px(
+        depth,
+        valid,
+        width_px,
+        smooth_sigma_px,
+    )
+    if not (np.isfinite(resolved_width) and resolved_width > 0.0):
+        info["width_source"] = "invalid_width"
+        return info
+
+    l0_boundary = _boundary_pixels_inside_component(outer_mask, l1_mask)
+    if not np.any(l0_boundary):
+        info["width_px"] = float(resolved_width)
+        info["width_source"] = "missing_l0_l1_boundary"
+        return info
+
+    src = np.ones(depth.shape[:2], dtype=np.uint8)
+    src[l0_boundary] = 0
+    dist = cv2.distanceTransform(src, cv2.DIST_L2, 5).astype(np.float32)
+    transition = outer_mask & np.isfinite(dist) & (dist <= float(resolved_width))
+    if not np.any(transition):
+        info["width_px"] = float(resolved_width)
+        info["width_source"] = width_source
+        return info
+
+    flux[transition] = _truncated_gaussian_fade_values(
+        float(background_flux),
+        float(l1_flux),
+        dist[transition],
+        float(resolved_width),
+        float(alpha),
+    )
+    info.update(
+        {
+            "width_px": float(resolved_width),
+            "width_source": str(width_source),
+            "alpha": float(alpha),
+            "applied_pixel_count": int(np.count_nonzero(transition)),
+        }
+    )
+    return info
 
 
 def _level_flux_value(

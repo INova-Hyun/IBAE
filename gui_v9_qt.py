@@ -4443,6 +4443,14 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             "level_ratio": self.analysis_context.get("level_ratio", None),
             "custom_contour_values": self.analysis_context.get("custom_contour_values", None),
             "sigma_px": self.analysis_context.get("smooth_sigma_px", None),
+            "l0_l1_transition_mode": self.analysis_context.get("l0_l1_transition_mode", "gaussian"),
+            "l0_l1_transition_width_px": self.analysis_context.get("l0_l1_transition_width_px", None),
+            "l0_l1_transition_width_source": self.analysis_context.get("l0_l1_transition_width_source", None),
+            "l0_l1_transition_alpha": self.analysis_context.get("l0_l1_transition_alpha", 3.0),
+            "l0_l1_transition_applied_pixel_count": self.analysis_context.get(
+                "l0_l1_transition_applied_pixel_count",
+                None,
+            ),
             "colormap": self.analysis_context.get("cmap_name", self.cmap_name),
             "log_color": self.analysis_context.get("log_enabled", self.log_enabled),
         }
@@ -4585,6 +4593,14 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             "level_ratio": self.analysis_context.get("level_ratio", None),
             "custom_contour_values": self.analysis_context.get("custom_contour_values", None),
             "smooth_sigma_px": self.analysis_context.get("smooth_sigma_px", None),
+            "l0_l1_transition_mode": self.analysis_context.get("l0_l1_transition_mode", "gaussian"),
+            "l0_l1_transition_width_px": self.analysis_context.get("l0_l1_transition_width_px", None),
+            "l0_l1_transition_width_source": self.analysis_context.get("l0_l1_transition_width_source", None),
+            "l0_l1_transition_alpha": self.analysis_context.get("l0_l1_transition_alpha", 3.0),
+            "l0_l1_transition_applied_pixel_count": self.analysis_context.get(
+                "l0_l1_transition_applied_pixel_count",
+                None,
+            ),
             "cmap_name": str(self.cmap_name),
             "log_enabled": bool(self.log_enabled),
         }
@@ -5415,16 +5431,44 @@ class QtFluxReconstructionDialog(QDialog):
             )
         return (str(color_mode), repr(color_norm))
 
+    @staticmethod
+    def _normalize_l0_l1_transition_mode(mode: object) -> str:
+        mode_norm = str(mode or "gaussian").strip().lower()
+        if mode_norm in ("flat", "none", "off", "disabled", "legacy"):
+            return "flat"
+        return "gaussian"
+
+    def _l0_l1_transition_mode(self) -> str:
+        return self._normalize_l0_l1_transition_mode(
+            self.analysis_context.get("l0_l1_transition_mode", "gaussian")
+        )
+
+    def _l0_l1_transition_width_px(self) -> Optional[float]:
+        value = _safe_float(self.analysis_context.get("l0_l1_transition_width_px", None))
+        if np.isfinite(value) and value > 0.0:
+            return float(value)
+        return None
+
+    def _l0_l1_transition_alpha(self) -> float:
+        value = _safe_float(self.analysis_context.get("l0_l1_transition_alpha", 3.0), 3.0)
+        if np.isfinite(value) and value > 0.0:
+            return float(value)
+        return 3.0
+
     def _reconstruction_key(self, ratio_value: float):
         custom_key = None
         if self.custom_contour_values:
             custom_key = tuple(float(v) for v in self.custom_contour_values)
+        transition_width = self._l0_l1_transition_width_px()
         return (
             0.0,
             float(self.l1_flux_spin.value()),
             float(ratio_value),
             float(self.sigma_spin.value()),
             custom_key,
+            self._l0_l1_transition_mode(),
+            None if transition_width is None else float(transition_width),
+            float(self._l0_l1_transition_alpha()),
         )
 
     def _build_color_norm(
@@ -5448,6 +5492,9 @@ class QtFluxReconstructionDialog(QDialog):
             smooth_sigma_px=float(self.sigma_spin.value()),
             contour_values=self.custom_contour_values,
             include_target_flux_map=False,
+            l0_l1_transition_mode=self._l0_l1_transition_mode(),
+            l0_l1_transition_width_px=self._l0_l1_transition_width_px(),
+            l0_l1_transition_alpha=self._l0_l1_transition_alpha(),
         )
         self._reconstruction_cache.clear()
         self._reconstruction_cache[key] = rec
@@ -5501,6 +5548,17 @@ class QtFluxReconstructionDialog(QDialog):
                 "level_ratio": payload.get("level_ratio", None),
                 "custom_contour_values": payload.get("custom_contour_values", None),
                 "smooth_sigma_px": payload.get("smooth_sigma_px", None),
+                "l0_l1_transition_mode": payload.get("l0_l1_transition_mode", self._l0_l1_transition_mode()),
+                "l0_l1_transition_width_px": payload.get("l0_l1_transition_width_px", None),
+                "l0_l1_transition_width_source": payload.get("l0_l1_transition_width_source", None),
+                "l0_l1_transition_alpha": payload.get(
+                    "l0_l1_transition_alpha",
+                    self._l0_l1_transition_alpha(),
+                ),
+                "l0_l1_transition_applied_pixel_count": payload.get(
+                    "l0_l1_transition_applied_pixel_count",
+                    None,
+                ),
                 "cmap_name": payload.get("cmap_name", self._current_cmap_name()),
                 "log_enabled": payload.get("log_enabled", self.log_color_check.isChecked()),
             }
@@ -5609,6 +5667,23 @@ class QtFluxReconstructionDialog(QDialog):
             return False
         if not self._metadata_custom_values_match(metadata.get("custom_contour_values", None), self.custom_contour_values):
             return False
+        expected_mode = self._l0_l1_transition_mode()
+        stored_mode = self._normalize_l0_l1_transition_mode(metadata.get("l0_l1_transition_mode", "flat"))
+        if stored_mode != expected_mode:
+            return False
+        if expected_mode == "gaussian":
+            if not self._metadata_float_matches(
+                metadata.get("l0_l1_transition_alpha", 3.0),
+                self._l0_l1_transition_alpha(),
+            ):
+                return False
+            expected_width = self._l0_l1_transition_width_px()
+            if expected_width is not None:
+                if not self._metadata_float_matches(
+                    metadata.get("l0_l1_transition_width_px", None),
+                    float(expected_width),
+                ):
+                    return False
         return True
 
     def _seed_reconstruction_cache_from_arrays(
@@ -5706,6 +5781,28 @@ class QtFluxReconstructionDialog(QDialog):
                 self._set_colormap_by_name(str(flux_reconstruction.get("colormap")))
             if flux_reconstruction.get("log_color", None) is not None:
                 self.log_color_check.setChecked(bool(flux_reconstruction.get("log_color")))
+            self.analysis_context["l0_l1_transition_mode"] = self._normalize_l0_l1_transition_mode(
+                flux_reconstruction.get("l0_l1_transition_mode", "flat")
+            )
+            transition_width = _safe_float(flux_reconstruction.get("l0_l1_transition_width_px", None))
+            self.analysis_context["l0_l1_transition_width_px"] = (
+                float(transition_width) if np.isfinite(transition_width) and transition_width > 0.0 else None
+            )
+            transition_alpha = _safe_float(flux_reconstruction.get("l0_l1_transition_alpha", 3.0), 3.0)
+            self.analysis_context["l0_l1_transition_alpha"] = (
+                float(transition_alpha) if np.isfinite(transition_alpha) and transition_alpha > 0.0 else 3.0
+            )
+            if flux_reconstruction.get("l0_l1_transition_width_source", None) is not None:
+                self.analysis_context["l0_l1_transition_width_source"] = str(
+                    flux_reconstruction.get("l0_l1_transition_width_source")
+                )
+            if flux_reconstruction.get("l0_l1_transition_applied_pixel_count", None) is not None:
+                try:
+                    self.analysis_context["l0_l1_transition_applied_pixel_count"] = int(
+                        flux_reconstruction.get("l0_l1_transition_applied_pixel_count")
+                    )
+                except Exception:
+                    self.analysis_context["l0_l1_transition_applied_pixel_count"] = None
             custom_values = flux_reconstruction.get("custom_contour_values", None)
             if isinstance(custom_values, (list, tuple)):
                 parsed_values: List[float] = []
@@ -5926,6 +6023,7 @@ class QtFluxReconstructionDialog(QDialog):
         rec = self._reconstruction(ratio_value)
         flux = np.asarray(rec["smoothed_flux_map"], dtype=np.float32)
         valid_u8 = np.asarray(rec["valid_mask"], dtype=np.uint8)
+        transition_info = dict(rec.get("l0_l1_transition", {}) or {})
         valid = valid_u8 > 0
         min_flux = float(rec["min_flux"])
         max_flux = float(rec["max_flux"])
@@ -5995,6 +6093,22 @@ class QtFluxReconstructionDialog(QDialog):
             "level_ratio": float(ratio_value),
             "custom_contour_values": None if not self.custom_contour_values else [float(v) for v in self.custom_contour_values],
             "smooth_sigma_px": float(self.sigma_spin.value()),
+            "l0_l1_transition_mode": self._normalize_l0_l1_transition_mode(
+                transition_info.get("mode", self._l0_l1_transition_mode())
+            ),
+            "l0_l1_transition_width_px": float(
+                _safe_float(transition_info.get("width_px", float("nan")))
+            ),
+            "l0_l1_transition_width_source": str(transition_info.get("width_source", "")),
+            "l0_l1_transition_alpha": float(
+                _safe_float(
+                    transition_info.get("alpha", self._l0_l1_transition_alpha()),
+                    self._l0_l1_transition_alpha(),
+                )
+            ),
+            "l0_l1_transition_applied_pixel_count": int(
+                transition_info.get("applied_pixel_count", 0) or 0
+            ),
             "cmap_name": str(cmap_name),
             "log_enabled": bool(self.log_color_check.isChecked()),
             "color_mode": str(color_mode),

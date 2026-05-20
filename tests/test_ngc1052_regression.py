@@ -112,6 +112,51 @@ def test_legacy_transverse_gaussian_bounded_baseline_wrapper():
     assert -0.05 <= float(params["baseline"]) <= 0.2
 
 
+def test_l0_l1_gaussian_transition_only_modifies_l0_band():
+    pytest.importorskip("cv2")
+
+    from IBAE.flux import reconstruct_flux_from_levels
+
+    depth = np.zeros((9, 15), dtype=np.int32)
+    roi = np.ones_like(depth, dtype=np.uint8)
+    depth[3:6, 4:11] = 1
+    depth[4, 6:9] = 2
+
+    gaussian = reconstruct_flux_from_levels(
+        region_depth_map=depth,
+        roi_mask=roi,
+        background_flux=0.0,
+        l1_flux=10.0,
+        level_ratio=2.0,
+        smooth_sigma_px=0.0,
+        l0_l1_transition_width_px=3.0,
+        l0_l1_transition_alpha=3.0,
+    )
+    target = np.asarray(gaussian["target_flux_map"], dtype=np.float32)
+    transition = dict(gaussian["l0_l1_transition"])
+
+    assert transition["mode"] == "gaussian"
+    assert transition["width_source"] == "requested"
+    assert int(transition["applied_pixel_count"]) > 0
+    assert target[4, 3] == pytest.approx(10.0)
+    assert 0.0 < float(target[4, 2]) < 10.0
+    assert target[4, 0] == pytest.approx(0.0)
+    assert target[4, 7] >= 10.0
+
+    legacy = reconstruct_flux_from_levels(
+        region_depth_map=depth,
+        roi_mask=roi,
+        background_flux=0.0,
+        l1_flux=10.0,
+        level_ratio=2.0,
+        smooth_sigma_px=0.0,
+        l0_l1_transition_mode="flat",
+    )
+    legacy_target = np.asarray(legacy["target_flux_map"], dtype=np.float32)
+    assert np.all(legacy_target[depth == 0] == 0.0)
+    assert dict(legacy["l0_l1_transition"])["mode"] == "flat"
+
+
 @pytest.mark.regression
 def test_v9_startup_loader_reads_analysis_json_roi_snapshot():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -263,6 +308,12 @@ def test_ngc1052_flux_reconstruction_matches_cached_npz():
     from IBAE.flux import reconstruct_flux_from_levels
 
     flux_cfg = dict(payload["flux_reconstruction"])
+    transition_width = flux_cfg.get("l0_l1_transition_width_px", None)
+    transition_width_px = None
+    if transition_width is not None:
+        transition_width = float(transition_width)
+        if np.isfinite(transition_width) and transition_width > 0.0:
+            transition_width_px = float(transition_width)
     result = reconstruct_flux_from_levels(
         region_depth_map=cache["region_depth_map"],
         roi_mask=cache["roi_mask"],
@@ -272,6 +323,9 @@ def test_ngc1052_flux_reconstruction_matches_cached_npz():
         smooth_sigma_px=float(flux_cfg["sigma_px"]),
         contour_values=flux_cfg.get("custom_contour_values"),
         include_target_flux_map=False,
+        l0_l1_transition_mode=str(flux_cfg.get("l0_l1_transition_mode", "flat")),
+        l0_l1_transition_width_px=transition_width_px,
+        l0_l1_transition_alpha=float(flux_cfg.get("l0_l1_transition_alpha", 3.0)),
     )
 
     actual = np.asarray(result["smoothed_flux_map"], dtype=np.float32)
