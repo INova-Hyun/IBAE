@@ -27,6 +27,13 @@ def _startup_banner(image_path: str) -> str:
     return f"=== Jet Analyzer v9 (Qt) / {IBAE_VERSION_NAME} v{_ibae_package_version()} Started: {image_path} ==="
 
 
+def _normalize_l0_l1_transition_mode(mode: object) -> str:
+    mode_norm = str(mode or "gaussian").strip().lower()
+    if mode_norm in {"flat", "none", "off", "disabled", "legacy"}:
+        return "flat"
+    return "gaussian"
+
+
 class JetAnalyzerV9Qt(JetAnalyzerV8Simple):
     """
     v9 Qt GUI version.
@@ -236,6 +243,27 @@ class JetAnalyzerV9Qt(JetAnalyzerV8Simple):
             flux_rec.get("custom_contour_values", None),
         ):
             return False
+        expected_transition = _normalize_l0_l1_transition_mode(
+            flux_rec.get("l0_l1_transition_mode", "gaussian")
+        )
+        stored_transition = _normalize_l0_l1_transition_mode(
+            metadata.get("l0_l1_transition_mode", "flat")
+        )
+        if stored_transition != expected_transition:
+            return False
+        if expected_transition == "gaussian":
+            expected_alpha = flux_rec.get("l0_l1_transition_alpha", 3.0)
+            if not self._float_matches(metadata.get("l0_l1_transition_alpha", 3.0), expected_alpha):
+                return False
+            expected_width = flux_rec.get("l0_l1_transition_width_px", None)
+            if expected_width is not None:
+                try:
+                    expected_width_f = float(expected_width)
+                except Exception:
+                    expected_width_f = float("nan")
+                if np.isfinite(expected_width_f) and expected_width_f > 0.0:
+                    if not self._float_matches(metadata.get("l0_l1_transition_width_px", None), expected_width_f):
+                        return False
         image_path = str(payload.get("image_path", "") or "")
         if image_path and bool(self._simple_replay_strict_image_match()):
             if not self._image_path_matches_or_moved_copy(image_path, self.image_path):

@@ -200,6 +200,25 @@ def test_qapplication_reference_survives_after_ensure_qt_app():
     assert qtwidgets.QApplication.instance() is not None
 
 
+def test_mojave_polar_auto_picks_core_peak_and_tail():
+    pytest.importorskip("PyQt5")
+
+    from IBAE.gui_v9_qt import infer_mojave_polar_core_tail
+
+    flux = np.zeros((7, 12), dtype=np.float32)
+    support = np.zeros_like(flux, dtype=np.uint8)
+    support[3, 2:10] = 1
+    flux[3, 2:10] = 1.0
+    flux[3, 2] = 20.0
+
+    picks = infer_mojave_polar_core_tail(flux, support)
+
+    assert picks["core_xy"] == (2, 3)
+    assert picks["core_source"] == "flux_peak"
+    assert picks["tail_xy"] == (9, 3)
+    assert picks["tail_source"] == "farthest_support"
+
+
 @pytest.mark.regression
 def test_v9_startup_loader_reads_analysis_json_roi_snapshot():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -214,6 +233,20 @@ def test_v9_startup_loader_reads_analysis_json_roi_snapshot():
     assert analyzer._startup_loaded_analysis_path == str(ANALYSIS_PATH)
     assert len(session["roi_points_xy"]) == len(payload["roi_points_xy"])
     assert session["roi_points_xy"][:3] == payload["roi_points_xy"][:3]
+
+
+@pytest.mark.regression
+def test_v9_loader_rejects_legacy_flat_l0_cache_for_gaussian_default():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PyQt5")
+
+    payload = _load_payload()
+    cache = _load_cache()
+    from IBAE.analyzer_v9_qt import JetAnalyzerV9Qt
+
+    analyzer = JetAnalyzerV9Qt(str(IMAGE_PATH))
+
+    assert analyzer._cache_metadata_matches_payload(dict(cache["metadata"]), payload) is False
 
 
 @pytest.mark.regression

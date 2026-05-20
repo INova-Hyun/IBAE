@@ -1621,6 +1621,71 @@ def _mas_axis_values_from_measurement(
     return _scale_px_values_to_mas(px_values, scale_mas_per_px)
 
 
+def infer_mojave_polar_core_tail(
+    flux_map: np.ndarray,
+    support_mask: np.ndarray,
+    core_xy: Optional[Point] = None,
+    tail_xy: Optional[Point] = None,
+) -> Dict[str, object]:
+    flux = np.asarray(flux_map, dtype=np.float32)
+    support = (np.asarray(support_mask, dtype=np.uint8) > 0) & np.isfinite(flux)
+    if flux.ndim != 2:
+        raise ValueError("Flux map must be a 2D array.")
+    if support.shape[:2] != flux.shape[:2]:
+        raise ValueError("Support mask shape must match flux map shape.")
+    if not np.any(support):
+        raise ValueError("No valid support region for automatic MOJAVE polar picks.")
+
+    if core_xy is None:
+        ys, xs = np.where(support)
+        values = flux[ys, xs]
+        idx = int(np.nanargmax(values))
+        core = (int(xs[idx]), int(ys[idx]))
+        core_source = "flux_peak"
+    else:
+        core = (int(core_xy[0]), int(core_xy[1]))
+        core_source = "provided"
+
+    if tail_xy is None:
+        h, w = flux.shape[:2]
+        cx = int(np.clip(core[0], 0, w - 1))
+        cy = int(np.clip(core[1], 0, h - 1))
+        comp_mask = support
+        comp_count, labels = cv2.connectedComponents(support.astype(np.uint8), connectivity=8)
+        if int(comp_count) > 1:
+            label_at_core = int(labels[cy, cx])
+            if label_at_core <= 0:
+                ys_all, xs_all = np.where(support)
+                dist2_all = np.square(xs_all.astype(np.float64) - float(core[0])) + np.square(ys_all.astype(np.float64) - float(core[1]))
+                nearest = int(np.argmin(dist2_all))
+                label_at_core = int(labels[int(ys_all[nearest]), int(xs_all[nearest])])
+            if label_at_core > 0:
+                comp_mask = labels == label_at_core
+        ys, xs = np.where(comp_mask)
+        if xs.size <= 1:
+            raise ValueError("Automatic MOJAVE polar tail pick needs at least two support pixels.")
+        dist2 = np.square(xs.astype(np.float64) - float(core[0])) + np.square(ys.astype(np.float64) - float(core[1]))
+        idx = int(np.argmax(dist2))
+        tail = (int(xs[idx]), int(ys[idx]))
+        tail_source = "farthest_support"
+        tail_distance_px = float(np.sqrt(float(dist2[idx])))
+    else:
+        tail = (int(tail_xy[0]), int(tail_xy[1]))
+        tail_source = "provided"
+        tail_distance_px = float(np.hypot(float(tail[0] - core[0]), float(tail[1] - core[1])))
+
+    if tail_distance_px <= 1e-6:
+        raise ValueError("Automatic MOJAVE polar core and tail picks are not separated.")
+    return {
+        "core_xy": core,
+        "tail_xy": tail,
+        "core_source": core_source,
+        "tail_source": tail_source,
+        "tail_distance_px": float(tail_distance_px),
+        "core_flux": float(flux[core[1], core[0]]) if 0 <= core[1] < flux.shape[0] and 0 <= core[0] < flux.shape[1] else float("nan"),
+    }
+
+
 def _calibration_summary_text(calibration_context: Optional[Dict[str, object]]) -> str:
     ctx = dict(calibration_context or {})
     scale = float(ctx.get("scale_mas_per_px", float("nan")))
@@ -2479,8 +2544,8 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         self._init_viewport_state(self.base_image.shape[:2], max_width, max_height - 280)
 
         self.info_label = QLabel(
-            "Left click: core then tail | Right click: remove nearest point | "
-            "Extract ridgeline, then measure FWHM | After FWHM, left click stages a slice for Details."
+            "MOJAVE polar can auto-pick core/tail | Left click: override core then tail | "
+            "Right click: remove nearest point | After FWHM, left click stages a slice for Details."
         )
         self.calibration_label = QLabel(_calibration_summary_text(self.calibration_context))
         self.stats_label = QLabel("Ridgeline: not extracted")
@@ -4387,13 +4452,27 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         self.refresh_view(sync_sliders=False)
 
     def _extract_ridgeline(self) -> None:
-        if self.core_xy is None or self.tail_xy is None:
-            self.stats_label.setText("Ridgeline: select core and tail first.")
-            return
         smooth_level = int(self.ridge_smooth_spin.value())
         smooth_window = max(1, 1 + (4 * max(0, smooth_level)))
         bspline_smoothing = float(max(0, smooth_level) ** 2) * 1.5
         mode = str(self.ridge_mode_combo.currentData() or "mojave_polar")
+        auto_pick_info: Dict[str, object] = {}
+        if mode.strip().lower() in {"mojave", "mojave_polar", "polar"} and (self.core_xy is None or self.tail_xy is None):
+            try:
+                auto_pick_info = infer_mojave_polar_core_tail(
+                    self.flux_map,
+                    self.support_mask,
+                    core_xy=self.core_xy,
+                    tail_xy=self.tail_xy,
+                )
+                self.core_xy = tuple(map(int, auto_pick_info["core_xy"]))
+                self.tail_xy = tuple(map(int, auto_pick_info["tail_xy"]))
+            except Exception as exc:
+                self.stats_label.setText(f"Ridgeline auto-pick failed: {exc}")
+                return
+        if self.core_xy is None or self.tail_xy is None:
+            self.stats_label.setText("Ridgeline: select core and tail first.")
+            return
         polar_smoothing_px = float(max(0, smooth_level)) * 0.25
         polar_threshold = None
         l0_rms_flux = _safe_float(
@@ -4445,6 +4524,13 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             "outlier_filtered_count": int(result.get("outlier_filtered_count", 0)),
             "polar_parameters": dict(result.get("polar_parameters", {}) or {}),
         }
+        if auto_pick_info:
+            self.ridgeline_metadata["auto_picks"] = {
+                "core_source": str(auto_pick_info.get("core_source", "")),
+                "tail_source": str(auto_pick_info.get("tail_source", "")),
+                "tail_distance_px": float(auto_pick_info.get("tail_distance_px", float("nan"))),
+                "core_flux": float(auto_pick_info.get("core_flux", float("nan"))),
+            }
         self.width_lines_xy = []
         self.measure_result = None
         self.trend_rows = []
@@ -4457,9 +4543,10 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             result="Trend fit result: measure widths first.",
             details="Window ensemble: measure widths first",
         )
+        auto_suffix = " | auto picks" if auto_pick_info else ""
         self.stats_label.setText(
             f"Ridgeline extracted ({self.ridgeline_metadata['extraction_mode']}): "
-            f"{int(len(self.ridge_xy))} points | Core={self.core_xy} Tail={self.tail_xy}"
+            f"{int(len(self.ridge_xy))} points | Core={self.core_xy} Tail={self.tail_xy}{auto_suffix}"
         )
         self.refresh_view(sync_sliders=False)
 
@@ -5819,7 +5906,7 @@ class QtFluxReconstructionDialog(QDialog):
             if flux_reconstruction.get("log_color", None) is not None:
                 self.log_color_check.setChecked(bool(flux_reconstruction.get("log_color")))
             self.analysis_context["l0_l1_transition_mode"] = self._normalize_l0_l1_transition_mode(
-                flux_reconstruction.get("l0_l1_transition_mode", "flat")
+                flux_reconstruction.get("l0_l1_transition_mode", "gaussian")
             )
             transition_width = _safe_float(flux_reconstruction.get("l0_l1_transition_width_px", None))
             self.analysis_context["l0_l1_transition_width_px"] = (
