@@ -448,7 +448,7 @@ class JetAnalyzerV9Qt(JetAnalyzerV8Simple):
         )
 
     def run(self):
-        print(_startup_banner(self.image_path))
+        print(_startup_banner(self.image_path), flush=True)
         replay_session = self._load_replay_session_from_config()
         if replay_session is not None:
             print(f"-> Loading replay JSON: {self._loaded_replay_json_path}")

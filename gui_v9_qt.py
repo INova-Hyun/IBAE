@@ -104,16 +104,18 @@ def _prepare_qt_runtime_env() -> None:
             os.environ["QT_PLUGIN_PATH"] = plugin_root
 
 
+_QT_APP = None
+
+
 def ensure_qt_app() -> QApplication:
+    global _QT_APP
     _prepare_qt_runtime_env()
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv[:1])
         app.setApplicationName("IBAE Opening Angle Qt")
+    _QT_APP = app
     return app
-
-
-_QT_APP = None
 
 
 def _analysis_image_path(analysis_context: Dict[str, object]) -> str:

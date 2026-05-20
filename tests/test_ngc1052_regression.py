@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import gc
 import json
 import os
 import sys
@@ -184,6 +185,19 @@ def test_v9_startup_banner_names_ibae_v1():
     assert "Jet Analyzer v9" in banner
     assert "IBAE_v1" in banner
     assert "sample.png" in banner
+
+
+def test_qapplication_reference_survives_after_ensure_qt_app():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PyQt5.QtWidgets")
+
+    from IBAE.gui_v9_qt import ensure_qt_app
+
+    app = ensure_qt_app()
+    assert qtwidgets.QApplication.instance() is app
+    del app
+    gc.collect()
+    assert qtwidgets.QApplication.instance() is not None
 
 
 @pytest.mark.regression
