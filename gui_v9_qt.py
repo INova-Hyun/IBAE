@@ -2195,6 +2195,23 @@ class QtSliceDetailsDialog(QDialog):
         fit_window = self._fit_dict().get("fit_window", {})
         return dict(fit_window) if isinstance(fit_window, dict) else {}
 
+    @staticmethod
+    def _gaussian_model_y(x: np.ndarray, params: Dict[str, object]) -> np.ndarray:
+        x_arr = np.asarray(x, dtype=np.float64)
+        baseline = _safe_float(params.get("baseline", float("nan")))
+        amplitude = _safe_float(params.get("amplitude", float("nan")))
+        mu = _safe_float(params.get("mu", float("nan")))
+        sigma = _safe_float(params.get("sigma", float("nan")))
+        if not (
+            np.isfinite(baseline)
+            and np.isfinite(amplitude)
+            and np.isfinite(mu)
+            and np.isfinite(sigma)
+            and sigma > 0.0
+        ):
+            return np.full(x_arr.shape, np.nan, dtype=np.float64)
+        return baseline + (amplitude * np.exp(-0.5 * np.square((x_arr - mu) / max(sigma, 1e-12))))
+
     def _mas_value(self, px_key: str, mas_key: str) -> float:
         mas_val = _safe_float(self.record.get(mas_key, float("nan")))
         if np.isfinite(mas_val):
@@ -2406,18 +2423,22 @@ class QtSliceDetailsDialog(QDialog):
         fit_x = np.asarray(fit.get("x", []), dtype=np.float64)
         fit_y = np.asarray(fit.get("fit_y", []), dtype=np.float64)
         fit_data_y = np.asarray(fit.get("y", []), dtype=np.float64)
-        fit_x_mas = _scale_px_values_to_mas(fit_x, profile_scale)
-        if fit_x.size == fit_y.size and fit_x.size > 0:
-            finite_fit = np.isfinite(fit_x_mas) & np.isfinite(fit_y)
+        full_fit_x = np.asarray(fit.get("full_x", []), dtype=np.float64)
+        if full_fit_x.size <= 0:
+            full_fit_x = fit_x
+        full_fit_y = self._gaussian_model_y(full_fit_x, params)
+        full_fit_x_mas = _scale_px_values_to_mas(full_fit_x, profile_scale)
+        if full_fit_x.size == full_fit_y.size and full_fit_x.size > 0:
+            finite_fit = np.isfinite(full_fit_x_mas) & np.isfinite(full_fit_y)
             if np.any(finite_fit):
-                order = np.argsort(fit_x_mas[finite_fit])
+                order = np.argsort(full_fit_x_mas[finite_fit])
                 self.profile_ax.plot(
-                    fit_x_mas[finite_fit][order],
-                    fit_y[finite_fit][order],
+                    full_fit_x_mas[finite_fit][order],
+                    full_fit_y[finite_fit][order],
                     "-",
                     color="#d62728",
                     linewidth=1.6,
-                    label="Gaussian fit",
+                    label="Gaussian fit (full profile)",
                 )
 
         baseline = _safe_float(params.get("baseline", float("nan")))
@@ -2473,6 +2494,7 @@ class QtSliceDetailsDialog(QDialog):
             self.profile_ax.axvline(-half_raw, color="#ff7f0e", linestyle="--", linewidth=1.2, label="FWHM half points")
             self.profile_ax.axvline(half_raw, color="#ff7f0e", linestyle="--", linewidth=1.2)
 
+        fit_x_mas = _scale_px_values_to_mas(fit_x, profile_scale)
         if fit_x.size == fit_y.size == fit_data_y.size and fit_x.size > 0:
             finite_res = np.isfinite(fit_x_mas) & np.isfinite(fit_y) & np.isfinite(fit_data_y)
             if np.any(finite_res):
