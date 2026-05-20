@@ -1599,6 +1599,26 @@ def _finite_or_zero(value: object) -> float:
     return float(val)
 
 
+def _scale_px_values_to_mas(values_px: object, scale_mas_per_px: object) -> np.ndarray:
+    values = np.asarray(values_px, dtype=np.float64)
+    scale = _safe_float(scale_mas_per_px)
+    if np.isfinite(scale) and scale > 0.0:
+        return (values * float(scale)).astype(np.float64)
+    return np.full(values.shape, np.nan, dtype=np.float64)
+
+
+def _mas_axis_values_from_measurement(
+    values_px: object,
+    values_mas: object,
+    scale_mas_per_px: object,
+) -> np.ndarray:
+    px_values = np.asarray(values_px, dtype=np.float64)
+    mas_values = np.asarray(values_mas, dtype=np.float64)
+    if mas_values.shape == px_values.shape and np.any(np.isfinite(mas_values)):
+        return mas_values.astype(np.float64)
+    return _scale_px_values_to_mas(px_values, scale_mas_per_px)
+
+
 def _calibration_summary_text(calibration_context: Optional[Dict[str, object]]) -> str:
     ctx = dict(calibration_context or {})
     scale = float(ctx.get("scale_mas_per_px", float("nan")))
@@ -2260,11 +2280,13 @@ class QtSliceDetailsDialog(QDialog):
         fit_window = self._fit_window_dict()
 
         valid_x, valid_y = self._profile_xy_arrays()
+        profile_scale = _safe_float(self.calibration_context.get("scale_mas_per_px", float("nan")))
+        valid_x_mas = _scale_px_values_to_mas(valid_x, profile_scale)
         if valid_x.size == valid_y.size and valid_x.size > 0:
-            finite = np.isfinite(valid_x) & np.isfinite(valid_y)
+            finite = np.isfinite(valid_x_mas) & np.isfinite(valid_y)
             if np.any(finite):
                 self.profile_ax.plot(
-                    valid_x[finite],
+                    valid_x_mas[finite],
                     valid_y[finite],
                     "o-",
                     color="#1f77b4",
@@ -2274,10 +2296,12 @@ class QtSliceDetailsDialog(QDialog):
                 )
         window_left = _safe_float(fit_window.get("left_x", float("nan")))
         window_right = _safe_float(fit_window.get("right_x", float("nan")))
-        if np.isfinite(window_left) and np.isfinite(window_right) and window_right > window_left:
+        window_left_mas = float(window_left * profile_scale) if np.isfinite(window_left) and np.isfinite(profile_scale) and profile_scale > 0.0 else float("nan")
+        window_right_mas = float(window_right * profile_scale) if np.isfinite(window_right) and np.isfinite(profile_scale) and profile_scale > 0.0 else float("nan")
+        if np.isfinite(window_left_mas) and np.isfinite(window_right_mas) and window_right_mas > window_left_mas:
             self.profile_ax.axvspan(
-                window_left,
-                window_right,
+                window_left_mas,
+                window_right_mas,
                 color="#d62728",
                 alpha=0.08,
                 label="Gaussian fit window",
@@ -2286,12 +2310,13 @@ class QtSliceDetailsDialog(QDialog):
         fit_x = np.asarray(fit.get("x", []), dtype=np.float64)
         fit_y = np.asarray(fit.get("fit_y", []), dtype=np.float64)
         fit_data_y = np.asarray(fit.get("y", []), dtype=np.float64)
+        fit_x_mas = _scale_px_values_to_mas(fit_x, profile_scale)
         if fit_x.size == fit_y.size and fit_x.size > 0:
-            finite_fit = np.isfinite(fit_x) & np.isfinite(fit_y)
+            finite_fit = np.isfinite(fit_x_mas) & np.isfinite(fit_y)
             if np.any(finite_fit):
-                order = np.argsort(fit_x[finite_fit])
+                order = np.argsort(fit_x_mas[finite_fit])
                 self.profile_ax.plot(
-                    fit_x[finite_fit][order],
+                    fit_x_mas[finite_fit][order],
                     fit_y[finite_fit][order],
                     "-",
                     color="#d62728",
@@ -2323,6 +2348,8 @@ class QtSliceDetailsDialog(QDialog):
         half_flux = float(half_metrics.get("half_flux", float("nan")))
         half_left = float(half_metrics.get("left_x", float("nan")))
         half_right = float(half_metrics.get("right_x", float("nan")))
+        half_left_mas = float(half_left * profile_scale) if np.isfinite(half_left) and np.isfinite(profile_scale) and profile_scale > 0.0 else float("nan")
+        half_right_mas = float(half_right * profile_scale) if np.isfinite(half_right) and np.isfinite(profile_scale) and profile_scale > 0.0 else float("nan")
         if np.isfinite(half_flux):
             self.profile_ax.axhline(
                 half_flux,
@@ -2331,31 +2358,31 @@ class QtSliceDetailsDialog(QDialog):
                 linewidth=1.1,
                 label="ridge-center half flux",
             )
-        if np.isfinite(half_flux) and np.isfinite(half_left):
+        if np.isfinite(half_flux) and np.isfinite(half_left_mas):
             self.profile_ax.axvline(
-                half_left,
+                half_left_mas,
                 color="#2ca02c",
                 linestyle="--",
                 linewidth=1.2,
                 label="ridge half-flux points",
             )
-            self.profile_ax.plot([half_left], [half_flux], "s", color="#2ca02c", markersize=5.0)
-        if np.isfinite(half_flux) and np.isfinite(half_right):
-            self.profile_ax.axvline(half_right, color="#2ca02c", linestyle="--", linewidth=1.2)
-            self.profile_ax.plot([half_right], [half_flux], "s", color="#2ca02c", markersize=5.0)
+            self.profile_ax.plot([half_left_mas], [half_flux], "s", color="#2ca02c", markersize=5.0)
+        if np.isfinite(half_flux) and np.isfinite(half_right_mas):
+            self.profile_ax.axvline(half_right_mas, color="#2ca02c", linestyle="--", linewidth=1.2)
+            self.profile_ax.plot([half_right_mas], [half_flux], "s", color="#2ca02c", markersize=5.0)
 
         raw_fwhm = _safe_float(self.record.get("fwhm_px", fit.get("fwhm_px", float("nan"))))
-        if np.isfinite(raw_fwhm) and raw_fwhm > 0.0:
-            half_raw = 0.5 * float(raw_fwhm)
+        if np.isfinite(raw_fwhm) and raw_fwhm > 0.0 and np.isfinite(profile_scale) and profile_scale > 0.0:
+            half_raw = 0.5 * float(raw_fwhm) * float(profile_scale)
             self.profile_ax.axvline(-half_raw, color="#ff7f0e", linestyle="--", linewidth=1.2, label="FWHM half points")
             self.profile_ax.axvline(half_raw, color="#ff7f0e", linestyle="--", linewidth=1.2)
 
         if fit_x.size == fit_y.size == fit_data_y.size and fit_x.size > 0:
-            finite_res = np.isfinite(fit_x) & np.isfinite(fit_y) & np.isfinite(fit_data_y)
+            finite_res = np.isfinite(fit_x_mas) & np.isfinite(fit_y) & np.isfinite(fit_data_y)
             if np.any(finite_res):
                 residual = fit_data_y[finite_res] - fit_y[finite_res]
                 self.residual_ax.plot(
-                    fit_x[finite_res],
+                    fit_x_mas[finite_res],
                     residual,
                     "o-",
                     color="#4c78a8",
@@ -2368,7 +2395,17 @@ class QtSliceDetailsDialog(QDialog):
         self.profile_ax.set_ylabel("Flux / reconstructed level")
         self.profile_ax.grid(alpha=0.25)
         self.profile_ax.legend(loc="best")
-        self.residual_ax.set_xlabel("Transverse offset from ridgeline center (px)")
+        if not (np.isfinite(profile_scale) and profile_scale > 0.0):
+            self.profile_ax.text(
+                0.5,
+                0.5,
+                "Scale calibration required for mas profile axis",
+                transform=self.profile_ax.transAxes,
+                ha="center",
+                va="center",
+                color="#666666",
+            )
+        self.residual_ax.set_xlabel("Transverse offset from ridgeline center (mas)")
         self.residual_ax.set_ylabel("Residual")
         self.residual_ax.grid(alpha=0.25)
         self.canvas.draw_idle()
@@ -2508,11 +2545,11 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         self.profile_ax = self.profile_fig.add_subplot(211)
         self.angle_ax = self.profile_fig.add_subplot(212, sharex=self.profile_ax)
         self.profile_ax.set_title("Width Result")
-        self.profile_ax.set_xlabel("Distance from Core (px)")
+        self.profile_ax.set_xlabel("Distance from Core (mas)")
         self.profile_ax.set_ylabel("FWHM (px)")
         self.profile_ax.grid(alpha=0.25)
         self.angle_ax.set_title("Opening Angle")
-        self.angle_ax.set_xlabel("Distance from Core (px)")
+        self.angle_ax.set_xlabel("Distance from Core (mas)")
         self.angle_ax.set_ylabel("Opening angle (deg)")
         self.angle_ax.grid(alpha=0.25)
 
@@ -4958,11 +4995,11 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         self.angle_ax.clear()
         if self.measure_result is None:
             self.profile_ax.set_title("Width Result")
-            self.profile_ax.set_xlabel("Distance from Core (px)")
+            self.profile_ax.set_xlabel("Distance from Core (mas)")
             self.profile_ax.set_ylabel("FWHM (px)")
             self.profile_ax.grid(alpha=0.25)
             self.angle_ax.set_title("Opening Angle")
-            self.angle_ax.set_xlabel("Distance from Core (px)")
+            self.angle_ax.set_xlabel("Distance from Core (mas)")
             self.angle_ax.set_ylabel("Opening angle (deg)")
             self.angle_ax.grid(alpha=0.25)
             self.profile_canvas.draw_idle()
@@ -4975,6 +5012,7 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             dtype=np.float32,
         )
         fwhm_px = np.asarray(self.measure_result.get("fwhm_px", np.array([], dtype=np.float32)), dtype=np.float32)
+        dist_mas = np.asarray(self.measure_result.get("distance_from_core_mas", np.array([], dtype=np.float32)), dtype=np.float32)
         fwhm_mas = np.asarray(self.measure_result.get("fwhm_mas", np.array([], dtype=np.float32)), dtype=np.float32)
         fwhm_sigma_px = np.asarray(self.measure_result.get("fwhm_sigma_px", np.array([], dtype=np.float32)), dtype=np.float32)
         fwhm_sigma_mas = np.asarray(self.measure_result.get("fwhm_sigma_mas", np.array([], dtype=np.float32)), dtype=np.float32)
@@ -4993,23 +5031,20 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             dtype=np.float32,
         )
         scale = float(self.calibration_context.get("scale_mas_per_px", float("nan")))
-        if np.isfinite(scale) and scale > 0.0:
-            x = np.asarray(
-                self.measure_result.get(
-                    "distance_from_core_mas",
-                    dist_px * scale,
-                ),
-                dtype=np.float32,
-            )
-            x_label = "Distance from Core (mas)"
-        else:
-            x = dist_px
-            x_label = "Distance from Core (px)"
-        y = fwhm_mas if np.isfinite(scale) and scale > 0.0 and np.any(np.isfinite(fwhm_mas)) else fwhm_px
-        y_sigma = fwhm_sigma_mas if y is fwhm_mas else fwhm_sigma_px
-        intrinsic_y = intrinsic_mas if y is fwhm_mas else intrinsic_px
-        intrinsic_y_sigma = intrinsic_sigma_mas if y is fwhm_mas else intrinsic_sigma_px
-        y_label = "FWHM (mas)" if y is fwhm_mas else "FWHM (px)"
+        x = _mas_axis_values_from_measurement(dist_px, dist_mas, scale).astype(np.float32)
+        x_label = "Distance from Core (mas)"
+        use_y_mas = np.any(np.isfinite(fwhm_mas))
+        if not use_y_mas and np.isfinite(scale) and scale > 0.0:
+            fwhm_mas = (fwhm_px * float(scale)).astype(np.float32)
+            fwhm_sigma_mas = (fwhm_sigma_px * float(scale)).astype(np.float32)
+            intrinsic_mas = (intrinsic_px * float(scale)).astype(np.float32)
+            intrinsic_sigma_mas = (intrinsic_sigma_px * float(scale)).astype(np.float32)
+            use_y_mas = True
+        y = fwhm_mas if use_y_mas else fwhm_px
+        y_sigma = fwhm_sigma_mas if use_y_mas else fwhm_sigma_px
+        intrinsic_y = intrinsic_mas if use_y_mas else intrinsic_px
+        intrinsic_y_sigma = intrinsic_sigma_mas if use_y_mas else intrinsic_sigma_px
+        y_label = "FWHM (mas)" if use_y_mas else "FWHM (px)"
 
         mask_obs = np.isfinite(x) & np.isfinite(y) & (x > 0.0) & (y > 0.0)
         mask_intr = np.isfinite(x) & np.isfinite(intrinsic_y) & (x > 0.0) & (intrinsic_y > 0.0)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -10,6 +11,20 @@ from . import gui_v9_qt as qt_v9_mod
 from .session_analysis import load_analysis_session, load_reconstruction_cache
 from .session_replay import load_replay_session, normalize_replay_session_payload
 from .analyzer_v8 import JetAnalyzerV8Simple, _build_roi_from_polygon
+
+
+IBAE_VERSION_NAME = "IBAE_v1"
+
+
+def _ibae_package_version() -> str:
+    try:
+        return str(version("IBAE"))
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _startup_banner(image_path: str) -> str:
+    return f"=== Jet Analyzer v9 (Qt) / {IBAE_VERSION_NAME} v{_ibae_package_version()} Started: {image_path} ==="
 
 
 class JetAnalyzerV9Qt(JetAnalyzerV8Simple):
@@ -433,7 +448,7 @@ class JetAnalyzerV9Qt(JetAnalyzerV8Simple):
         )
 
     def run(self):
-        print(f"=== Jet Analyzer v9 (Qt) Started: {self.image_path} ===")
+        print(_startup_banner(self.image_path))
         replay_session = self._load_replay_session_from_config()
         if replay_session is not None:
             print(f"-> Loading replay JSON: {self._loaded_replay_json_path}")

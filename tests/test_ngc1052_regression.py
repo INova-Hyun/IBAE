@@ -157,6 +157,35 @@ def test_l0_l1_gaussian_transition_only_modifies_l0_band():
     assert dict(legacy["l0_l1_transition"])["mode"] == "flat"
 
 
+def test_width_profile_axis_values_do_not_fallback_to_px():
+    pytest.importorskip("PyQt5")
+
+    from IBAE.gui_v9_qt import _mas_axis_values_from_measurement
+
+    px_values = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    missing_mas = np.full(px_values.shape, np.nan, dtype=np.float32)
+
+    scaled = _mas_axis_values_from_measurement(px_values, missing_mas, 0.2)
+    np.testing.assert_allclose(scaled, np.asarray([0.2, 0.4, 0.6]), rtol=0.0, atol=1e-8)
+
+    saved = _mas_axis_values_from_measurement(px_values, np.asarray([0.3, 0.6, 0.9]), float("nan"))
+    np.testing.assert_allclose(saved, np.asarray([0.3, 0.6, 0.9]), rtol=0.0, atol=1e-8)
+
+    unavailable = _mas_axis_values_from_measurement(px_values, missing_mas, float("nan"))
+    assert np.all(np.isnan(unavailable))
+
+
+def test_v9_startup_banner_names_ibae_v1():
+    pytest.importorskip("PyQt5")
+
+    from IBAE.analyzer_v9_qt import _startup_banner
+
+    banner = _startup_banner("sample.png")
+    assert "Jet Analyzer v9" in banner
+    assert "IBAE_v1" in banner
+    assert "sample.png" in banner
+
+
 @pytest.mark.regression
 def test_v9_startup_loader_reads_analysis_json_roi_snapshot():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
