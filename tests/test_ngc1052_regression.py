@@ -219,6 +219,28 @@ def test_mojave_polar_auto_picks_core_peak_and_tail():
     assert picks["tail_source"] == "farthest_support"
 
 
+def test_flux_zero_support_extends_to_first_zero_boundary():
+    pytest.importorskip("PyQt5")
+
+    from IBAE.gui_v9_qt import build_flux_zero_support_mask
+
+    flux = np.zeros((5, 9), dtype=np.float32)
+    roi = np.ones_like(flux, dtype=np.uint8)
+    depth = np.zeros_like(flux, dtype=np.int32)
+    flux[2, 3:6] = [0.1, 0.5, 0.1]
+    depth[2, 4] = 1
+
+    support = build_flux_zero_support_mask(flux, roi, depth)
+
+    assert support[2, 3] == 1
+    assert support[2, 4] == 1
+    assert support[2, 5] == 1
+    assert support[2, 2] == 1
+    assert support[2, 6] == 1
+    assert support[2, 0] == 0
+    assert support[2, 8] == 0
+
+
 @pytest.mark.regression
 def test_v9_startup_loader_reads_analysis_json_roi_snapshot():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

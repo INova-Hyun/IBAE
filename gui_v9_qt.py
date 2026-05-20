@@ -1686,6 +1686,35 @@ def infer_mojave_polar_core_tail(
     }
 
 
+def build_flux_zero_support_mask(
+    flux_map: np.ndarray,
+    roi_mask: np.ndarray,
+    region_depth_map: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    flux = np.asarray(flux_map, dtype=np.float32)
+    roi = np.asarray(roi_mask, dtype=np.uint8) > 0
+    valid = roi & np.isfinite(flux)
+    finite_values = flux[valid]
+    positive_values = finite_values[finite_values > 0.0]
+    if positive_values.size > 0:
+        eps = float(max(1e-12, 1e-7 * float(np.nanmax(positive_values))))
+    else:
+        eps = 1e-12
+
+    positive = valid & (flux > eps)
+    if region_depth_map is not None:
+        depth = np.asarray(region_depth_map, dtype=np.int32)
+        if depth.shape[:2] == flux.shape[:2]:
+            positive |= valid & (depth > 0)
+    if not np.any(positive):
+        return np.zeros(flux.shape[:2], dtype=np.uint8)
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    adjacent_to_positive = cv2.dilate(positive.astype(np.uint8), kernel, iterations=1) > 0
+    zero_boundary = valid & (np.abs(flux) <= eps) & adjacent_to_positive
+    return (positive | zero_boundary).astype(np.uint8)
+
+
 def _calibration_summary_text(calibration_context: Optional[Dict[str, object]]) -> str:
     ctx = dict(calibration_context or {})
     scale = float(ctx.get("scale_mas_per_px", float("nan")))
@@ -2498,7 +2527,11 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         self.flux_map = np.asarray(flux_map, dtype=np.float32)
         self.region_depth_map = np.asarray(region_depth_map, dtype=np.int32)
         self.roi_mask = np.asarray(roi_mask, dtype=np.uint8)
-        self.support_mask = ((self.region_depth_map > 0) & (self.roi_mask > 0)).astype(np.uint8)
+        self.support_mask = build_flux_zero_support_mask(
+            self.flux_map,
+            self.roi_mask,
+            self.region_depth_map,
+        )
         self.thin_mask = np.asarray(thin_mask, dtype=np.uint8)
         self.cmap_name = str(cmap_name)
         self.log_enabled = bool(log_enabled)
