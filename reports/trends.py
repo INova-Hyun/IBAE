@@ -15,6 +15,7 @@ from ..ridgeline.analysis import (
     _opening_model_sigma_from_log_width,
     _robust_sigma,
     _safe_float,
+    evaluate_gaussian_fit_stability,
     opening_angle_deg,
     opening_angle_error_deg,
 )
@@ -111,21 +112,12 @@ def build_gaussian_report_rows(
             full_profile_span = float("nan")
         if not np.isfinite(full_profile_span):
             full_profile_span = _safe_float(item.get("profile_full_span_px", float("nan")))
-        gaussian_half_left = -0.5 * float(fwhm_px)
-        gaussian_half_right = 0.5 * float(fwhm_px)
-        instability_reasons: List[str] = []
-        if np.isfinite(fit_window_span) and fit_window_span > 0.0:
-            if gaussian_half_left < fit_window_left or gaussian_half_right > fit_window_right:
-                instability_reasons.append("fwhm_halfpoints_outside_fit_window")
-            if np.isfinite(gaussian_sigma_px) and gaussian_sigma_px > (0.45 * fit_window_span):
-                instability_reasons.append("sigma_too_broad_for_fit_window")
-        if np.isfinite(full_profile_span) and full_profile_span > 0.0 and fwhm_px > (1.05 * full_profile_span):
-            instability_reasons.append("fwhm_larger_than_profile_span")
-        if np.isfinite(gaussian_amplitude) and gaussian_amplitude > 1e-9 and np.isfinite(gaussian_rmse):
-            if (gaussian_rmse / gaussian_amplitude) > 0.35:
-                instability_reasons.append("rmse_large_vs_amplitude")
-        elif not (np.isfinite(gaussian_amplitude) and gaussian_amplitude > 0.0):
-            instability_reasons.append("invalid_gaussian_amplitude")
+        stability = evaluate_gaussian_fit_stability(item, fit=fit)
+        if "gaussian_unstable" in item:
+            for key in list(stability.keys()):
+                if key in item:
+                    stability[key] = item[key]
+        instability_reasons = list(stability.get("gaussian_unstable_reasons", []) or [])
         slice_order += 1
         rows.append(
             {
@@ -178,7 +170,18 @@ def build_gaussian_report_rows(
                 "gaussian_fit_window_right_px": float(fit_window_right),
                 "gaussian_fit_window_span_px": float(fit_window_span),
                 "gaussian_full_profile_span_px": float(full_profile_span),
-                "gaussian_unstable": bool(instability_reasons),
+                "gaussian_half_left_px": _safe_float(stability.get("gaussian_half_left_px", float("nan"))),
+                "gaussian_half_right_px": _safe_float(stability.get("gaussian_half_right_px", float("nan"))),
+                "gaussian_mu_bound_fraction": _safe_float(stability.get("gaussian_mu_bound_fraction", float("nan"))),
+                "gaussian_pa_rms_fraction": _safe_float(stability.get("gaussian_pa_rms_fraction", float("nan"))),
+                "ridge_center_half_flux_level": _safe_float(stability.get("ridge_center_half_flux_level", float("nan"))),
+                "ridge_center_half_flux_left_px": _safe_float(stability.get("ridge_center_half_flux_left_px", float("nan"))),
+                "ridge_center_half_flux_right_px": _safe_float(stability.get("ridge_center_half_flux_right_px", float("nan"))),
+                "ridge_center_half_flux_width_px": _safe_float(stability.get("ridge_center_half_flux_width_px", float("nan"))),
+                "gaussian_fwhm_to_half_flux_width_ratio": _safe_float(
+                    stability.get("gaussian_fwhm_to_half_flux_width_ratio", float("nan"))
+                ),
+                "gaussian_unstable": bool(stability.get("gaussian_unstable", bool(instability_reasons))),
                 "gaussian_unstable_reasons": list(instability_reasons),
                 "used_width_source": str(used_width_source),
             }

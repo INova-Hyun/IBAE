@@ -92,6 +92,8 @@ def test_default_transverse_gaussian_baseline_is_fixed_zero():
     assert params["baseline"] == 0.0
     assert params["baseline_mode"] == "fixed_zero"
     assert params["baseline_fixed"] is True
+    assert fit["optimizer"] == "robust_least_squares"
+    assert fit["loss"] == "soft_l1"
 
 
 def test_legacy_transverse_gaussian_bounded_baseline_wrapper():
@@ -111,6 +113,71 @@ def test_legacy_transverse_gaussian_bounded_baseline_wrapper():
     assert params["baseline_mode"] == "legacy_bounded_l1_noise"
     assert params["baseline_fixed"] is False
     assert -0.05 <= float(params["baseline"]) <= 0.2
+
+
+def _stability_record(*, fwhm_px: float = 4.0, mu: float = 0.0, mu_bound_px: float = 10.0) -> dict:
+    return {
+        "fwhm_px": float(fwhm_px),
+        "fit": {
+            "rmse": 0.01,
+            "full_x": np.linspace(-20.0, 20.0, 41),
+            "fit_window": {"left_x": -20.0, "right_x": 20.0},
+            "params": {
+                "amplitude": 1.0,
+                "sigma": max(float(fwhm_px) / 2.354820045, 0.1),
+                "mu": float(mu),
+                "mu_bound_px": float(mu_bound_px),
+            },
+        },
+    }
+
+
+def test_gaussian_stability_uses_mu_centered_halfpoints():
+    from IBAE.ridgeline import evaluate_gaussian_fit_stability
+
+    record = _stability_record(fwhm_px=4.0, mu=3.0)
+    record["fit"]["fit_window"] = {"left_x": 1.0, "right_x": 4.0}
+
+    stability = evaluate_gaussian_fit_stability(record)
+
+    assert stability["gaussian_half_left_px"] == pytest.approx(1.0)
+    assert stability["gaussian_half_right_px"] == pytest.approx(5.0)
+    assert "fwhm_halfpoints_outside_fit_window" in stability["gaussian_unstable_reasons"]
+
+
+def test_gaussian_stability_flags_mu_near_bound():
+    from IBAE.ridgeline import evaluate_gaussian_fit_stability
+
+    stability = evaluate_gaussian_fit_stability(_stability_record(mu=9.6, mu_bound_px=10.0))
+
+    assert stability["gaussian_mu_bound_fraction"] == pytest.approx(0.96)
+    assert "mu_near_bound" in stability["gaussian_unstable_reasons"]
+
+
+def test_gaussian_stability_flags_pa_sweep_width_instability():
+    from IBAE.ridgeline import evaluate_gaussian_fit_stability
+
+    record = _stability_record(fwhm_px=100.0)
+    record["fwhm_pa_rms_px"] = 25.0
+    record["pa_sweep"] = {"enabled": True, "reliable": True}
+    stability = evaluate_gaussian_fit_stability(record)
+
+    assert stability["gaussian_pa_rms_fraction"] == pytest.approx(0.25)
+    assert "pa_sweep_width_unstable" in stability["gaussian_unstable_reasons"]
+
+
+def test_gaussian_stability_flags_half_flux_width_disagreement():
+    from IBAE.ridgeline import evaluate_gaussian_fit_stability
+
+    profile = {
+        "valid_x": np.asarray([-2.0, -1.0, 0.0, 1.0, 2.0]),
+        "valid_y": np.asarray([0.0, 0.5, 1.0, 0.5, 0.0]),
+    }
+    stability = evaluate_gaussian_fit_stability(_stability_record(fwhm_px=4.0), profile=profile)
+
+    assert stability["ridge_center_half_flux_width_px"] == pytest.approx(2.0)
+    assert stability["gaussian_fwhm_to_half_flux_width_ratio"] == pytest.approx(2.0)
+    assert "fwhm_disagrees_with_half_flux_width" in stability["gaussian_unstable_reasons"]
 
 
 def test_l0_l1_gaussian_transition_only_modifies_l0_band():
@@ -340,6 +407,50 @@ def test_mojave_polar_ridgeline_tracks_flux_spine():
         ((ridge[:, 0] - core[0]) * line[1]) - ((ridge[:, 1] - core[1]) * line[0])
     ) / line_len
     assert float(np.nanmedian(distances)) < 2.5
+
+
+def test_mojave_polar_stops_after_repeated_invalid_arc_span(monkeypatch):
+    import importlib
+
+    analysis = importlib.import_module("IBAE.ridgeline.analysis")
+    flux = np.ones((96, 128), dtype=np.float32)
+    support = np.ones_like(flux, dtype=np.uint8)
+    arc_calls = []
+
+    def fake_sample_support(mask, x, y):
+        arc_calls.append(1)
+        selected = np.zeros(np.asarray(x).shape, dtype=bool)
+        if len(arc_calls) <= 3:
+            selected[:] = True
+        else:
+            mid = selected.size // 2
+            selected[mid : mid + 2] = True
+        return selected
+
+    def fake_sample_flux(image, x, y):
+        return np.ones(np.asarray(x).shape, dtype=np.float64)
+
+    monkeypatch.setattr(analysis, "_sample_support_mask", fake_sample_support)
+    monkeypatch.setattr(analysis, "_sample_float_map", fake_sample_flux)
+
+    result = analysis.extract_ridgeline_mojave_polar(
+        flux,
+        support,
+        core_xy=(20, 40),
+        tail_xy=(70, 40),
+        polar_step_px=1.0,
+        polar_pa_step_deg=1.0,
+        polar_sector_width_deg=20.0,
+        polar_threshold=0.5,
+        polar_max_empty=3,
+        polar_min_arc_points=2,
+        polar_min_arc_span_deg=5.0,
+        polar_min_peak_over_threshold=1.0,
+        include_debug_maps=False,
+    )
+
+    assert result["raw_sample_count"] == 3
+    assert len(arc_calls) == 6
 
 
 def test_legacy_cost_path_ridgeline_mode_remains_callable():

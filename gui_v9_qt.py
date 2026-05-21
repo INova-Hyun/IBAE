@@ -69,6 +69,7 @@ from .ridgeline import (
     _blocked_median_summary,
     apply_core_separation_to_measure_result,
     beam_size_px as analysis_beam_size_px,
+    evaluate_gaussian_fit_stability,
     extract_ridgeline,
     fit_transverse_gaussian,
     measure_ridgeline_fwhm,
@@ -2195,6 +2196,33 @@ class QtSliceDetailsDialog(QDialog):
         fit_window = self._fit_dict().get("fit_window", {})
         return dict(fit_window) if isinstance(fit_window, dict) else {}
 
+    def _scan_xlim_mas(self, profile: Dict[str, object], scale_mas_per_px: object) -> Optional[Tuple[float, float]]:
+        scale = _safe_float(scale_mas_per_px)
+        if not (np.isfinite(scale) and scale > 0.0):
+            return None
+        half_width_px = _safe_float(profile.get("scan_half_width_px", self.record.get("scan_half_width_px", float("nan"))))
+        if np.isfinite(half_width_px) and half_width_px > 0.0:
+            half_width_mas = float(abs(half_width_px) * scale)
+            return -half_width_mas, half_width_mas
+        left_px = _safe_float(profile.get("scan_k_min_px", self.record.get("profile_scan_k_min_px", float("nan"))))
+        right_px = _safe_float(profile.get("scan_k_max_px", self.record.get("profile_scan_k_max_px", float("nan"))))
+        if not (np.isfinite(left_px) and np.isfinite(right_px) and right_px > left_px):
+            return None
+        return float(left_px * scale), float(right_px * scale)
+
+    def _gaussian_plot_x_px(self, profile: Dict[str, object], fit_x: np.ndarray) -> np.ndarray:
+        half_width_px = _safe_float(profile.get("scan_half_width_px", self.record.get("scan_half_width_px", float("nan"))))
+        if np.isfinite(half_width_px) and half_width_px > 0.0:
+            return np.linspace(-abs(float(half_width_px)), abs(float(half_width_px)), 600, dtype=np.float64)
+        left_px = _safe_float(profile.get("scan_k_min_px", self.record.get("profile_scan_k_min_px", float("nan"))))
+        right_px = _safe_float(profile.get("scan_k_max_px", self.record.get("profile_scan_k_max_px", float("nan"))))
+        if np.isfinite(left_px) and np.isfinite(right_px) and right_px > left_px:
+            return np.linspace(float(left_px), float(right_px), 600, dtype=np.float64)
+        full_fit_x = np.asarray(self._fit_dict().get("full_x", []), dtype=np.float64)
+        if full_fit_x.size > 0:
+            return full_fit_x
+        return np.asarray(fit_x, dtype=np.float64)
+
     @staticmethod
     def _gaussian_model_y(x: np.ndarray, params: Dict[str, object]) -> np.ndarray:
         x_arr = np.asarray(x, dtype=np.float64)
@@ -2337,6 +2365,22 @@ class QtSliceDetailsDialog(QDialog):
         pa_success = int(pa_sweep.get("success_count", 0) or 0) if isinstance(pa_sweep, dict) else 0
         half_metrics = self._ridge_center_half_flux_metrics()
         fit_window = self._fit_window_dict()
+        if "gaussian_unstable" in self.record:
+            gaussian_unstable = bool(self.record.get("gaussian_unstable", False))
+            stability_reasons = list(self.record.get("gaussian_unstable_reasons", []) or [])
+        else:
+            try:
+                stability = evaluate_gaussian_fit_stability(self.record, profile=profile, fit=fit)
+                gaussian_unstable = bool(stability.get("gaussian_unstable", False))
+                stability_reasons = list(stability.get("gaussian_unstable_reasons", []) or [])
+            except Exception:
+                gaussian_unstable = False
+                stability_reasons = []
+        stability_text = (
+            "unstable: " + ", ".join(str(reason) for reason in stability_reasons)
+            if gaussian_unstable
+            else "stable"
+        )
         lines = [
             f"Slice: ridge_idx={ridge_idx} | ridge center={self._point_text(ridge_xy)} | Gaussian mu={mu_text}",
             (
@@ -2373,6 +2417,7 @@ class QtSliceDetailsDialog(QDialog):
                 f"{_format_float_or_na(half_metrics['right_x'])} px | "
                 f"width={_format_float_or_na(half_metrics['width_px'])} px"
             ),
+            f"Gaussian stability: {stability_text}",
         ]
         if fit_window:
             lines.append(
@@ -2423,9 +2468,7 @@ class QtSliceDetailsDialog(QDialog):
         fit_x = np.asarray(fit.get("x", []), dtype=np.float64)
         fit_y = np.asarray(fit.get("fit_y", []), dtype=np.float64)
         fit_data_y = np.asarray(fit.get("y", []), dtype=np.float64)
-        full_fit_x = np.asarray(fit.get("full_x", []), dtype=np.float64)
-        if full_fit_x.size <= 0:
-            full_fit_x = fit_x
+        full_fit_x = self._gaussian_plot_x_px(profile, fit_x)
         full_fit_y = self._gaussian_model_y(full_fit_x, params)
         full_fit_x_mas = _scale_px_values_to_mas(full_fit_x, profile_scale)
         if full_fit_x.size == full_fit_y.size and full_fit_x.size > 0:
@@ -2438,7 +2481,7 @@ class QtSliceDetailsDialog(QDialog):
                     "-",
                     color="#d62728",
                     linewidth=1.6,
-                    label="Gaussian fit (full profile)",
+                    label="Gaussian fit (scan window)",
                 )
 
         baseline = _safe_float(params.get("baseline", float("nan")))
@@ -2513,6 +2556,10 @@ class QtSliceDetailsDialog(QDialog):
         self.profile_ax.set_ylabel("Flux / reconstructed level")
         self.profile_ax.grid(alpha=0.25)
         self.profile_ax.legend(loc="best")
+        scan_xlim = self._scan_xlim_mas(profile, profile_scale)
+        if scan_xlim is not None:
+            self.profile_ax.set_xlim(*scan_xlim)
+            self.residual_ax.set_xlim(*scan_xlim)
         if not (np.isfinite(profile_scale) and profile_scale > 0.0):
             self.profile_ax.text(
                 0.5,

@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from scipy.interpolate import UnivariateSpline, splprep, splev
 from scipy.ndimage import map_coordinates
-from scipy.optimize import curve_fit
+from scipy.optimize import least_squares
 from skimage import graph
 
 from ..common.numeric import robust_sigma as _robust_sigma_common
@@ -111,7 +111,22 @@ def _compact_gaussian_fit_result(fit: Dict[str, object]) -> Dict[str, object]:
     compact: Dict[str, object] = {
         "success": bool(src.get("success", False)),
     }
-    for key in ("reason", "error", "fit_window", "params", "param_errors", "fwhm_px", "fwhm_sigma_px", "rmse"):
+    for key in (
+        "reason",
+        "error",
+        "fit_window",
+        "params",
+        "param_errors",
+        "fwhm_px",
+        "fwhm_sigma_px",
+        "rmse",
+        "optimizer",
+        "loss",
+        "loss_f_scale",
+        "nfev",
+        "cost",
+        "optimality",
+    ):
         if key in src:
             compact[key] = src[key]
     return compact
@@ -119,6 +134,29 @@ def _compact_gaussian_fit_result(fit: Dict[str, object]) -> Dict[str, object]:
 
 def _unit_or_none(vec: Sequence[float]) -> Optional[np.ndarray]:
     return _unit_or_none_common(vec)
+
+
+def _least_squares_covariance(jacobian: np.ndarray, cost_sum: float, n_obs: int, n_params: int) -> np.ndarray:
+    jac = np.asarray(jacobian, dtype=np.float64)
+    if jac.ndim != 2 or jac.shape[0] <= 0 or jac.shape[1] <= 0:
+        return np.full((int(n_params), int(n_params)), np.inf, dtype=np.float64)
+    try:
+        _, singular_values, vt = np.linalg.svd(jac, full_matrices=False)
+    except Exception:
+        return np.full((int(n_params), int(n_params)), np.inf, dtype=np.float64)
+    if singular_values.size <= 0:
+        return np.full((int(n_params), int(n_params)), np.inf, dtype=np.float64)
+    threshold = np.finfo(float).eps * max(jac.shape) * float(singular_values[0])
+    keep = singular_values > threshold
+    if not np.any(keep):
+        return np.full((int(n_params), int(n_params)), np.inf, dtype=np.float64)
+    singular_values = singular_values[keep]
+    vt = vt[keep]
+    covariance = (vt.T / np.square(singular_values)) @ vt
+    dof = int(n_obs) - int(n_params)
+    if dof > 0 and np.isfinite(cost_sum):
+        covariance *= float(cost_sum) / float(dof)
+    return np.asarray(covariance, dtype=np.float64)
 
 
 def _dedupe_consecutive_points(points_xy: Sequence[Sequence[float]]) -> np.ndarray:
@@ -1111,6 +1149,13 @@ def extract_ridgeline_mojave_polar(
 
     raw_samples: List[Dict[str, float]] = []
     consecutive_empty = 0
+    max_empty = int(polar_max_empty)
+
+    def mark_empty_and_should_stop() -> bool:
+        nonlocal consecutive_empty
+        consecutive_empty += 1
+        return bool(raw_samples and max_empty > 0 and consecutive_empty >= max_empty)
+
     for radius in radial_grid:
         x_arc, y_arc = _polar_xy(core_input, float(radius), pa_grid)
         arc_support = _sample_support_mask(support, x_arc, y_arc)
@@ -1119,8 +1164,7 @@ def extract_ridgeline_mojave_polar(
         selected = _select_polar_arc_component(valid, values, polar_component_mode)
         n_selected = int(np.count_nonzero(selected))
         if n_selected < max(2, int(polar_min_arc_points)):
-            consecutive_empty += 1
-            if raw_samples and polar_max_empty > 0 and consecutive_empty >= int(polar_max_empty):
+            if mark_empty_and_should_stop():
                 break
             continue
         pa_selected = pa_grid[selected]
@@ -1131,15 +1175,18 @@ def extract_ridgeline_mojave_polar(
         pa_span = float(np.nanmax(pa_selected) - np.nanmin(pa_selected)) if pa_selected.size else 0.0
         peak = float(np.nanmax(values_selected)) if values_selected.size else float("nan")
         if pa_span < float(max(0.0, polar_min_arc_span_deg)):
-            consecutive_empty += 1
+            if mark_empty_and_should_stop():
+                break
             continue
         if np.isfinite(threshold) and threshold > 0.0 and float(polar_min_peak_over_threshold) > 1.0:
             if not (np.isfinite(peak) and peak >= threshold * float(polar_min_peak_over_threshold)):
-                consecutive_empty += 1
+                if mark_empty_and_should_stop():
+                    break
                 continue
         pa_med = _weighted_median(pa_selected, weights)
         if not np.isfinite(pa_med):
-            consecutive_empty += 1
+            if mark_empty_and_should_stop():
+                break
             continue
         x_ridge, y_ridge = _polar_xy(core_input, float(radius), np.asarray([pa_med], dtype=np.float64))
         raw_samples.append(
@@ -1615,6 +1662,10 @@ def fit_transverse_gaussian(
         sigma = np.maximum(sigma, 1e-6)
         return a * np.exp(-0.5 * ((s - mu) / sigma) ** 2)
 
+    optimizer = "robust_least_squares"
+    loss_name = "soft_l1"
+    loss_f_scale = float(max(1e-6, 0.10 * max(amp0, 1e-6)))
+
     lower = np.array(
         [
             float(c_lower),
@@ -1635,23 +1686,50 @@ def fit_transverse_gaussian(
     )
     try:
         if baseline_is_fixed_zero:
-            popt, pcov = curve_fit(
-                gauss1d_zero,
-                x,
-                y,
-                p0=np.array([amp0, mu0, sigma0], dtype=np.float64),
-                bounds=(
-                    np.array([0.0, -mu_bound, 0.1], dtype=np.float64),
-                    np.array(
-                        [
-                            float(max(1.0, np.nanmax(y) * 4.0)),
-                            mu_bound,
-                            float(max(1.0, np.ptp(x))),
-                        ],
-                        dtype=np.float64,
-                    ),
-                ),
-                maxfev=20000,
+            lower_zero = np.array([0.0, -mu_bound, 0.1], dtype=np.float64)
+            upper_zero = np.array(
+                [
+                    float(max(1.0, np.nanmax(y) * 4.0)),
+                    mu_bound,
+                    float(max(1.0, np.ptp(x))),
+                ],
+                dtype=np.float64,
+            )
+
+            def residual_zero(params):
+                return gauss1d_zero(x, *params) - y
+
+            result = least_squares(
+                residual_zero,
+                x0=np.array([amp0, mu0, sigma0], dtype=np.float64),
+                bounds=(lower_zero, upper_zero),
+                loss=loss_name,
+                f_scale=loss_f_scale,
+                max_nfev=20000,
+            )
+            if not bool(result.success):
+                return {
+                    "success": False,
+                    "reason": "fit_failed",
+                    "error": str(result.message),
+                    "x": x.astype(np.float32),
+                    "y": y.astype(np.float32),
+                    "full_x": full_x,
+                    "full_y": full_y,
+                    "fit_window": fit_window,
+                    "optimizer": optimizer,
+                    "loss": loss_name,
+                    "loss_f_scale": float(loss_f_scale),
+                    "nfev": int(result.nfev),
+                    "cost": float(2.0 * result.cost),
+                    "optimality": float(result.optimality),
+                }
+            popt = result.x.astype(np.float64)
+            pcov = _least_squares_covariance(
+                result.jac,
+                cost_sum=float(2.0 * result.cost),
+                n_obs=int(x.size),
+                n_params=int(popt.size),
             )
             fit_y = gauss1d_zero(x, *popt)
             baseline = 0.0
@@ -1664,14 +1742,44 @@ def fit_transverse_gaussian(
                 sigma_sigma = float(math.sqrt(max(0.0, float(pcov[2, 2]))))
             except Exception:
                 sigma_sigma = float("nan")
+            nfev = int(result.nfev)
+            cost = float(2.0 * result.cost)
+            optimality = float(result.optimality)
         else:
-            popt, pcov = curve_fit(
-                gauss1d,
-                x,
-                y,
-                p0=np.array([c0, amp0, mu0, sigma0], dtype=np.float64),
+            def residual(params):
+                return gauss1d(x, *params) - y
+
+            result = least_squares(
+                residual,
+                x0=np.array([c0, amp0, mu0, sigma0], dtype=np.float64),
                 bounds=(lower, upper),
-                maxfev=20000,
+                loss=loss_name,
+                f_scale=loss_f_scale,
+                max_nfev=20000,
+            )
+            if not bool(result.success):
+                return {
+                    "success": False,
+                    "reason": "fit_failed",
+                    "error": str(result.message),
+                    "x": x.astype(np.float32),
+                    "y": y.astype(np.float32),
+                    "full_x": full_x,
+                    "full_y": full_y,
+                    "fit_window": fit_window,
+                    "optimizer": optimizer,
+                    "loss": loss_name,
+                    "loss_f_scale": float(loss_f_scale),
+                    "nfev": int(result.nfev),
+                    "cost": float(2.0 * result.cost),
+                    "optimality": float(result.optimality),
+                }
+            popt = result.x.astype(np.float64)
+            pcov = _least_squares_covariance(
+                result.jac,
+                cost_sum=float(2.0 * result.cost),
+                n_obs=int(x.size),
+                n_params=int(popt.size),
             )
             fit_y = gauss1d(x, *popt)
             baseline, amplitude, mu, sigma = [float(v) for v in popt]
@@ -1683,6 +1791,9 @@ def fit_transverse_gaussian(
                 sigma_sigma = float(math.sqrt(max(0.0, float(pcov[3, 3]))))
             except Exception:
                 sigma_sigma = float("nan")
+            nfev = int(result.nfev)
+            cost = float(2.0 * result.cost)
+            optimality = float(result.optimality)
         residual = y - fit_y
         rmse = float(np.sqrt(np.mean(residual ** 2)))
         fwhm = float(2.0 * math.sqrt(2.0 * math.log(2.0)) * sigma)
@@ -1717,6 +1828,12 @@ def fit_transverse_gaussian(
             "fwhm_sigma_px": float(fwhm_sigma),
             "rmse": float(rmse),
             "covariance": pcov,
+            "optimizer": optimizer,
+            "loss": loss_name,
+            "loss_f_scale": float(loss_f_scale),
+            "nfev": int(nfev),
+            "cost": float(cost),
+            "optimality": float(optimality),
         }
     except Exception as exc:
         return {
@@ -1728,7 +1845,198 @@ def fit_transverse_gaussian(
             "full_x": full_x,
             "full_y": full_y,
             "fit_window": fit_window,
+            "optimizer": optimizer,
+            "loss": loss_name,
+            "loss_f_scale": float(loss_f_scale),
         }
+
+
+def _profile_xy_arrays_for_stability(profile: Optional[Dict[str, object]]) -> Tuple[np.ndarray, np.ndarray]:
+    if not isinstance(profile, dict):
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+    x = np.asarray(profile.get("valid_x", []), dtype=np.float64)
+    y = np.asarray(profile.get("valid_y", []), dtype=np.float64)
+    if x.size <= 0 or y.size <= 0 or x.size != y.size:
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not np.any(finite):
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+    xf = x[finite]
+    yf = y[finite]
+    order = np.argsort(xf)
+    return xf[order], yf[order]
+
+
+def _interp_profile_y_at_zero(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size <= 0 or y.size <= 0 or x.size != y.size:
+        return float("nan")
+    if float(np.nanmin(x)) > 0.0 or float(np.nanmax(x)) < 0.0:
+        return float("nan")
+    return float(np.interp(0.0, x, y))
+
+
+def _profile_level_crossing(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    center_y: float,
+    level: float,
+    side: str,
+) -> float:
+    if (
+        x.size <= 0
+        or y.size <= 0
+        or x.size != y.size
+        or (not np.isfinite(center_y))
+        or (not np.isfinite(level))
+    ):
+        return float("nan")
+    if side == "left":
+        items = [(float(xi), float(yi)) for xi, yi in zip(x.tolist(), y.tolist()) if float(xi) < 0.0]
+        items.sort(key=lambda item: item[0], reverse=True)
+    else:
+        items = [(float(xi), float(yi)) for xi, yi in zip(x.tolist(), y.tolist()) if float(xi) > 0.0]
+        items.sort(key=lambda item: item[0])
+    prev_x = 0.0
+    prev_y = float(center_y)
+    prev_delta = prev_y - float(level)
+    for cur_x, cur_y in items:
+        if not (np.isfinite(cur_x) and np.isfinite(cur_y)):
+            continue
+        cur_delta = cur_y - float(level)
+        if abs(cur_delta) <= 1e-12:
+            return float(cur_x)
+        if prev_delta * cur_delta < 0.0:
+            denom = cur_y - prev_y
+            if abs(denom) <= 1e-12:
+                return float(cur_x)
+            return float(prev_x + ((float(level) - prev_y) * (cur_x - prev_x) / denom))
+        prev_x = cur_x
+        prev_y = cur_y
+        prev_delta = cur_delta
+    return float("nan")
+
+
+def _ridge_center_half_flux_metrics_from_profile(profile: Optional[Dict[str, object]]) -> Dict[str, float]:
+    x, y = _profile_xy_arrays_for_stability(profile)
+    center_flux = _interp_profile_y_at_zero(x, y)
+    half_flux = 0.5 * center_flux if np.isfinite(center_flux) else float("nan")
+    left_x = _profile_level_crossing(x, y, center_y=center_flux, level=half_flux, side="left")
+    right_x = _profile_level_crossing(x, y, center_y=center_flux, level=half_flux, side="right")
+    width = float(right_x - left_x) if np.isfinite(left_x) and np.isfinite(right_x) else float("nan")
+    return {
+        "level": float(half_flux),
+        "left_x": float(left_x),
+        "right_x": float(right_x),
+        "width_px": float(width),
+    }
+
+
+def evaluate_gaussian_fit_stability(
+    record: Dict[str, object],
+    profile: Optional[Dict[str, object]] = None,
+    fit: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    rec = dict(record or {})
+    fit_obj = dict(fit) if isinstance(fit, dict) else dict(rec.get("fit", {}) if isinstance(rec.get("fit", {}), dict) else {})
+    params = fit_obj.get("params", {})
+    params = params if isinstance(params, dict) else {}
+    fit_window = fit_obj.get("fit_window", {})
+    fit_window = fit_window if isinstance(fit_window, dict) else {}
+
+    fwhm_px = _safe_float(rec.get("fwhm_px", fit_obj.get("fwhm_px", float("nan"))))
+    fwhm_pa_rms_px = _safe_float(rec.get("fwhm_pa_rms_px", float("nan")))
+    gaussian_rmse = _safe_float(fit_obj.get("rmse", float("nan")))
+    gaussian_amplitude = _safe_float(params.get("amplitude", float("nan")))
+    gaussian_sigma_px = _safe_float(params.get("sigma", float("nan")))
+    mu = _safe_float(params.get("mu", float("nan")))
+    mu_bound = _safe_float(params.get("mu_bound_px", float("nan")))
+    fit_window_left = _safe_float(fit_window.get("left_x", float("nan")))
+    fit_window_right = _safe_float(fit_window.get("right_x", float("nan")))
+    fit_window_span = (
+        float(fit_window_right - fit_window_left)
+        if np.isfinite(fit_window_left) and np.isfinite(fit_window_right) and fit_window_right > fit_window_left
+        else float("nan")
+    )
+    try:
+        full_fit_x = np.asarray(fit_obj.get("full_x", fit_obj.get("x", [])), dtype=np.float64)
+        full_fit_x = full_fit_x[np.isfinite(full_fit_x)]
+        full_profile_span = float(np.ptp(full_fit_x)) if full_fit_x.size >= 2 else float("nan")
+    except Exception:
+        full_profile_span = float("nan")
+    if not np.isfinite(full_profile_span):
+        full_profile_span = _safe_float(rec.get("profile_full_span_px", float("nan")))
+
+    gaussian_half_left = float(mu - (0.5 * fwhm_px)) if np.isfinite(mu) and np.isfinite(fwhm_px) and fwhm_px > 0.0 else float("nan")
+    gaussian_half_right = float(mu + (0.5 * fwhm_px)) if np.isfinite(mu) and np.isfinite(fwhm_px) and fwhm_px > 0.0 else float("nan")
+    mu_bound_fraction = float(abs(mu) / mu_bound) if np.isfinite(mu) and np.isfinite(mu_bound) and mu_bound > 0.0 else float("nan")
+    pa_rms_fraction = (
+        float(fwhm_pa_rms_px / fwhm_px)
+        if np.isfinite(fwhm_pa_rms_px) and np.isfinite(fwhm_px) and fwhm_px > 0.0
+        else float("nan")
+    )
+
+    half_metrics = _ridge_center_half_flux_metrics_from_profile(profile)
+    if not np.isfinite(half_metrics["level"]):
+        half_metrics = {
+            "level": _safe_float(rec.get("ridge_center_half_flux_level", float("nan"))),
+            "left_x": _safe_float(rec.get("ridge_center_half_flux_left_px", float("nan"))),
+            "right_x": _safe_float(rec.get("ridge_center_half_flux_right_px", float("nan"))),
+            "width_px": _safe_float(rec.get("ridge_center_half_flux_width_px", float("nan"))),
+        }
+    half_width = _safe_float(half_metrics.get("width_px", float("nan")))
+    fwhm_to_half_flux_ratio = (
+        float(fwhm_px / half_width)
+        if np.isfinite(fwhm_px) and fwhm_px > 0.0 and np.isfinite(half_width) and half_width > 0.0
+        else float("nan")
+    )
+
+    reasons: List[str] = []
+
+    def add_reason(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    if np.isfinite(fit_window_span) and fit_window_span > 0.0:
+        if (
+            np.isfinite(gaussian_half_left)
+            and np.isfinite(gaussian_half_right)
+            and (gaussian_half_left < fit_window_left or gaussian_half_right > fit_window_right)
+        ):
+            add_reason("fwhm_halfpoints_outside_fit_window")
+        if np.isfinite(gaussian_sigma_px) and gaussian_sigma_px > (0.45 * fit_window_span):
+            add_reason("sigma_too_broad_for_fit_window")
+    if np.isfinite(full_profile_span) and full_profile_span > 0.0 and np.isfinite(fwhm_px) and fwhm_px > (1.05 * full_profile_span):
+        add_reason("fwhm_larger_than_profile_span")
+    if np.isfinite(gaussian_amplitude) and gaussian_amplitude > 1e-9 and np.isfinite(gaussian_rmse):
+        if (gaussian_rmse / gaussian_amplitude) > 0.35:
+            add_reason("rmse_large_vs_amplitude")
+    elif not (np.isfinite(gaussian_amplitude) and gaussian_amplitude > 0.0):
+        add_reason("invalid_gaussian_amplitude")
+    if np.isfinite(mu_bound_fraction) and mu_bound_fraction >= 0.95:
+        add_reason("mu_near_bound")
+    pa_sweep = rec.get("pa_sweep", {})
+    if isinstance(pa_sweep, dict) and bool(pa_sweep.get("enabled", bool(pa_sweep))):
+        if pa_sweep.get("reliable", True) is False:
+            add_reason("pa_sweep_unreliable")
+        if np.isfinite(pa_rms_fraction) and pa_rms_fraction > 0.20:
+            add_reason("pa_sweep_width_unstable")
+    if np.isfinite(fwhm_to_half_flux_ratio) and (fwhm_to_half_flux_ratio < 0.67 or fwhm_to_half_flux_ratio > 1.50):
+        add_reason("fwhm_disagrees_with_half_flux_width")
+
+    return {
+        "gaussian_unstable": bool(reasons),
+        "gaussian_unstable_reasons": list(reasons),
+        "gaussian_half_left_px": float(gaussian_half_left),
+        "gaussian_half_right_px": float(gaussian_half_right),
+        "gaussian_mu_bound_fraction": float(mu_bound_fraction),
+        "gaussian_pa_rms_fraction": float(pa_rms_fraction),
+        "ridge_center_half_flux_level": float(half_metrics["level"]),
+        "ridge_center_half_flux_left_px": float(half_metrics["left_x"]),
+        "ridge_center_half_flux_right_px": float(half_metrics["right_x"]),
+        "ridge_center_half_flux_width_px": float(half_metrics["width_px"]),
+        "gaussian_fwhm_to_half_flux_width_ratio": float(fwhm_to_half_flux_ratio),
+    }
 
 
 def _rotate_unit_vector(vec_xy: Sequence[float], angle_deg: float) -> Tuple[float, float]:
@@ -1778,7 +2086,9 @@ def _pa_sweep_measurement_cache_key(
     digest.update(_hash_int_points(np.asarray(ridge_xy, dtype=np.int32)).encode("ascii"))
     digest.update(str(tuple(slices.tolist())).encode("ascii"))
     parts = [
-        "pa_sweep_v4",
+        "pa_sweep_v5",
+        "fit_optimizer=robust_least_squares",
+        "fit_loss=soft_l1",
         f"tangent={int(tangent_half_window)}",
         f"profile_step={_cache_float(profile_step_px)}",
         f"beam_px={_cache_float(beam_px)}",
@@ -2326,6 +2636,7 @@ def measure_ridgeline_fwhm(
             record["beam_deconvolved"] = bool(np.isfinite(beam_px) and beam_px > 0.0)
             if pa_sweep_summary is not None:
                 record["pa_sweep"] = pa_sweep_summary
+            record.update(evaluate_gaussian_fit_stability(record, profile=profile, fit=fit))
             fit_records.append(record)
         except Exception as exc:
             fit_records.append(
