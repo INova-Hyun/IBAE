@@ -55,6 +55,7 @@ from .reports import (
     compute_local_k,
     find_opening_angle_plateau,
     fit_power_law_from_rows,
+    fit_opening_angle_plateau_from_rows,
     paper_fig7_eastern_broken_power_law,
 )
 from .session_analysis import (
@@ -80,6 +81,7 @@ if not hasattr(_mpl_cbook.Grouper, "clean"):
     _mpl_cbook.Grouper.clean = lambda self: None
 
 Point = Tuple[int, int]
+DEFAULT_RIDGE_MIN_RMS = 8.0
 
 
 def _prepare_qt_runtime_env() -> None:
@@ -121,6 +123,26 @@ def ensure_qt_app() -> QApplication:
 
 def _analysis_image_path(analysis_context: Dict[str, object]) -> str:
     return str(dict(analysis_context or {}).get("image_path", "") or "")
+
+
+def _requested_l0_l1_transition_width_from_payload(payload: Dict[str, object]) -> Optional[float]:
+    value = _safe_float(dict(payload or {}).get("l0_l1_transition_requested_width_px", None))
+    return float(value) if np.isfinite(value) and value > 0.0 else None
+
+
+def _resolved_l0_l1_transition_width_from_payload(payload: Dict[str, object]) -> Optional[float]:
+    src = dict(payload or {})
+    value = _safe_float(src.get("l0_l1_transition_resolved_width_px", None))
+    if not (np.isfinite(value) and value > 0.0):
+        value = _safe_float(src.get("l0_l1_transition_width_px", None))
+    return float(value) if np.isfinite(value) and value > 0.0 else None
+
+
+def _ridge_min_rms_from_payload(payload: Dict[str, object], default: float = DEFAULT_RIDGE_MIN_RMS) -> float:
+    value = _safe_float(dict(payload or {}).get("ridge_min_rms", default), default)
+    if np.isfinite(value) and value > 0.0:
+        return float(value)
+    return float(default)
 
 
 def _load_calibration_image_from_path(image_path: str) -> Optional[np.ndarray]:
@@ -2668,9 +2690,11 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         self.ridge_mode_combo = QComboBox()
         self.ridge_mode_combo.addItem("MOJAVE polar", "mojave_polar")
         self.ridge_mode_combo.addItem("Legacy cost path", "legacy_cost_path")
-        self.slice_count_spin = QSpinBox()
-        self.slice_count_spin.setRange(2, 200)
-        self.slice_count_spin.setValue(25)
+        self.ridge_min_rms_spin = QDoubleSpinBox()
+        self.ridge_min_rms_spin.setRange(0.01, 1000.0)
+        self.ridge_min_rms_spin.setDecimals(2)
+        self.ridge_min_rms_spin.setSingleStep(0.5)
+        self.ridge_min_rms_spin.setValue(DEFAULT_RIDGE_MIN_RMS)
         self.core_separation_spin = QDoubleSpinBox()
         self.core_separation_spin.setRange(0.0, 1_000_000.0)
         self.core_separation_spin.setDecimals(4)
@@ -2888,7 +2912,7 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         controls.addRow("Pan Y", self.pan_y_slider)
         controls.addRow("Ridgeline Mode", self.ridge_mode_combo)
         controls.addRow("Snap Radius", self.snap_radius_spin)
-        controls.addRow("Fallback Slice Count", self.slice_count_spin)
+        controls.addRow("Ridge min RMS", self.ridge_min_rms_spin)
         controls.addRow("Trim Core Side (%)", self.trim_core_percent_spin)
         controls.addRow("Trim Tail Side (%)", self.trim_tail_percent_spin)
         controls.addRow("Ridgeline Smooth", self.ridge_smooth_spin)
@@ -3992,26 +4016,15 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             local_k = compute_local_k(x, y, window_points=effective_window, min_points=5)
 
         fit_mode = self._trend_fit_mode()
-        if self._auto_fit_range is None:
+        if self._auto_fit_range is None and fit_mode != "opening_plateau":
             try:
-                if fit_mode == "opening_plateau":
-                    auto = find_opening_angle_plateau(
-                        rows,
-                        distance_unit=distance_unit,
-                        min_points=max(8, effective_window),
-                    )
-                    self._auto_fit_range = (
-                        int(auto["plateau_start_slice_order"]),
-                        int(auto["plateau_end_slice_order"]),
-                    )
-                else:
-                    auto = auto_select_k_near_one_range(
-                        rows,
-                        local_k,
-                        distance_unit=distance_unit,
-                        min_points=max(5, effective_window),
-                    )
-                    self._auto_fit_range = (int(auto["start_slice_order"]), int(auto["end_slice_order"]))
+                auto = auto_select_k_near_one_range(
+                    rows,
+                    local_k,
+                    distance_unit=distance_unit,
+                    min_points=max(5, effective_window),
+                )
+                self._auto_fit_range = (int(auto["start_slice_order"]), int(auto["end_slice_order"]))
                 self._trend_controls_sync_enabled = False
                 self.fit_start_spin.setValue(self._auto_fit_range[0])
                 self.fit_end_spin.setValue(self._auto_fit_range[1])
@@ -4030,17 +4043,13 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         trend_result = None
         try:
             if fit_mode == "opening_plateau":
-                trend_result = find_opening_angle_plateau(
+                trend_result = fit_opening_angle_plateau_from_rows(
                     rows,
+                    start_slice_order=fit_start,
+                    end_slice_order=fit_end,
                     distance_unit=distance_unit,
                     min_points=max(8, effective_window),
                 )
-                self._trend_controls_sync_enabled = False
-                self.fit_start_spin.setValue(int(trend_result["plateau_start_slice_order"]))
-                self.fit_end_spin.setValue(int(trend_result["plateau_end_slice_order"]))
-                self._trend_controls_sync_enabled = True
-                fit_start = int(trend_result["plateau_start_slice_order"])
-                fit_end = int(trend_result["plateau_end_slice_order"])
             else:
                 trend_result = fit_power_law_from_rows(
                     rows,
@@ -4261,17 +4270,21 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
                 self.report_k_ax.axvspan(float(min(x_start, x_end)), float(max(x_start, x_end)), color="tab:gray", alpha=0.15, label="Fit range")
             if str(trend_result.get("fit_mode", "")) == "opening_plateau":
                 plateau_quality = "ok" if bool(trend_result.get("plateau_passes_thresholds", False)) else "weak"
+                plateau_selection = str(trend_result.get("plateau_selection_mode", "manual_range"))
                 self.trend_stats_label.setText(
                     f"usable={usable_rows} | filtered={len(excluded_rows)} | raw>beam={over_beam_rows} | "
                     f"sep={_format_float_or_na(sep_min, '.4g')}-{_format_float_or_na(sep_max, '.4g')} {distance_unit} | "
                     f"plateau={_format_float_or_na(float(trend_result.get('opening_fit_median_deg', float('nan'))), '.4g')}±"
                     f"{_format_float_or_na(float(trend_result.get('opening_fit_median_sigma_deg', float('nan'))), '.3g')} deg | "
+                    f"conical={_format_float_or_na(float(trend_result.get('opening_conical_fit_deg', float('nan'))), '.4g')}±"
+                    f"{_format_float_or_na(float(trend_result.get('opening_conical_fit_sigma_deg', float('nan'))), '.3g')} deg | "
                     f"sigma_theta={_format_float_or_na(float(trend_result.get('opening_sigma_deg', float('nan'))), '.4g')} deg | "
                     f"slope_theta={_format_float_or_na(float(trend_result.get('theta_slope_deg_per_dex', float('nan'))), '.4g')}±"
                     f"{_format_float_or_na(float(trend_result.get('theta_slope_sigma_deg_per_dex', float('nan'))), '.3g')} deg/dex | "
                     f"k_tail={_format_float_or_na(float(trend_result.get('k_fit', float('nan'))), '.4g')}±"
                     f"{_format_float_or_na(float(trend_result.get('k_sigma', float('nan'))), '.3g')} | "
                     f"quality={plateau_quality} | "
+                    f"selection={plateau_selection} | "
                     f"plateau slices={fit_start}-{fit_end} | "
                     f"basis={'intrinsic+raw width' if self.use_raw_width_check.isChecked() else 'intrinsic only'} | "
                     f"unstable filter={'on' if self.filter_unstable_gaussian_check.isChecked() else 'off'}"
@@ -4350,20 +4363,33 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         if trend_result is not None:
             if str(trend_result.get("fit_mode", "")) == "opening_plateau":
                 plateau_quality = "ok" if bool(trend_result.get("plateau_passes_thresholds", False)) else "weak"
+                plateau_selection = str(trend_result.get("plateau_selection_mode", "manual_range"))
                 self.trend_window_details.setPlainText(
                     "Plateau mode does not use Local k Window.\n"
                     f"quality={plateau_quality}\n"
+                    f"selection={plateau_selection}\n"
                     f"theta slope={_format_float_or_na(float(trend_result.get('theta_slope_deg_per_dex', float('nan'))), '.6g')}±"
                     f"{_format_float_or_na(float(trend_result.get('theta_slope_sigma_deg_per_dex', float('nan'))), '.3g')} deg/dex\n"
                     f"k_tail={_format_float_or_na(float(trend_result.get('k_fit', float('nan'))), '.6g')}±"
                     f"{_format_float_or_na(float(trend_result.get('k_sigma', float('nan'))), '.3g')}\n"
+                    f"conical theta={_format_float_or_na(float(trend_result.get('opening_conical_fit_deg', float('nan'))), '.6g')}±"
+                    f"{_format_float_or_na(float(trend_result.get('opening_conical_fit_sigma_deg', float('nan'))), '.3g')} deg | "
+                    f"total sigma={_format_float_or_na(float(trend_result.get('opening_conical_total_sigma_deg', float('nan'))), '.3g')} deg | "
+                    f"delta median={_format_float_or_na(float(trend_result.get('opening_conical_minus_plateau_median_deg', float('nan'))), '.3g')} deg\n"
+                    f"conical loss={str(trend_result.get('opening_conical_loss', 'n/a'))} | "
+                    f"chi2_nu={_format_float_or_na(float(trend_result.get('opening_conical_reduced_chi2', float('nan'))), '.3g')} | "
+                    f"n={int(trend_result.get('opening_conical_point_count', 0) or 0)} | "
+                    f"source={str(trend_result.get('opening_conical_used_width_source', 'intrinsic'))}\n"
                     f"plateau slices={fit_start}-{fit_end}"
                 )
                 self.trend_result_label.setText(
                     f"plateau opening = {_format_float_or_na(float(trend_result.get('opening_fit_median_deg', float('nan'))), '.6g')}±"
                     f"{_format_float_or_na(float(trend_result.get('opening_fit_median_sigma_deg', float('nan'))), '.3g')} deg\n"
+                    f"conical opening = {_format_float_or_na(float(trend_result.get('opening_conical_fit_deg', float('nan'))), '.6g')}±"
+                    f"{_format_float_or_na(float(trend_result.get('opening_conical_fit_sigma_deg', float('nan'))), '.3g')} deg "
+                    f"(total sigma={_format_float_or_na(float(trend_result.get('opening_conical_total_sigma_deg', float('nan'))), '.3g')} deg)\n"
                     f"opening σ = {_format_float_or_na(float(trend_result.get('opening_sigma_deg', float('nan'))), '.6g')} deg\n"
-                    f"quality = {plateau_quality} | slices = {fit_start} - {fit_end}"
+                    f"quality = {plateau_quality} | selection = {plateau_selection} | slices = {fit_start} - {fit_end}"
                 )
             else:
                 ensemble = list(trend_result.get("k_window_ensemble", []) or [])
@@ -4581,7 +4607,7 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             self.analysis_context.get("l0_rms_flux", self.analysis_context.get("background_flux", float("nan")))
         )
         if np.isfinite(l0_rms_flux) and l0_rms_flux > 0.0:
-            polar_threshold = float(3.0 * l0_rms_flux)
+            polar_threshold = float(self.ridge_min_rms_spin.value() * l0_rms_flux)
         polar_step_px = 4.0
         scale_mas_per_px = _safe_float(self.calibration_context.get("scale_mas_per_px", float("nan")))
         if np.isfinite(scale_mas_per_px) and scale_mas_per_px > 0.0:
@@ -4664,6 +4690,12 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
         )
         if not path:
             return
+        requested_transition_width = _safe_float(self.analysis_context.get("l0_l1_transition_requested_width_px", None))
+        requested_transition_width = (
+            float(requested_transition_width)
+            if np.isfinite(requested_transition_width) and requested_transition_width > 0.0
+            else None
+        )
         flux_reconstruction = {
             "background_flux": 0.0,
             "l0_rms_flux": self.analysis_context.get("l0_rms_flux", self.analysis_context.get("background_flux", None)),
@@ -4672,13 +4704,18 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             "custom_contour_values": self.analysis_context.get("custom_contour_values", None),
             "sigma_px": self.analysis_context.get("smooth_sigma_px", None),
             "l0_l1_transition_mode": self.analysis_context.get("l0_l1_transition_mode", "gaussian"),
-            "l0_l1_transition_width_px": self.analysis_context.get("l0_l1_transition_width_px", None),
+            "l0_l1_transition_requested_width_px": requested_transition_width,
+            "l0_l1_transition_width_px": requested_transition_width,
+            "l0_l1_transition_resolved_width_px": self.analysis_context.get("l0_l1_transition_resolved_width_px", None),
             "l0_l1_transition_width_source": self.analysis_context.get("l0_l1_transition_width_source", None),
             "l0_l1_transition_alpha": self.analysis_context.get("l0_l1_transition_alpha", 3.0),
             "l0_l1_transition_applied_pixel_count": self.analysis_context.get(
                 "l0_l1_transition_applied_pixel_count",
                 None,
             ),
+            "l0_l1_transition_local_width_median_px": self.analysis_context.get("l0_l1_transition_local_width_median_px", None),
+            "l0_l1_transition_local_width_min_px": self.analysis_context.get("l0_l1_transition_local_width_min_px", None),
+            "l0_l1_transition_local_width_max_px": self.analysis_context.get("l0_l1_transition_local_width_max_px", None),
             "colormap": self.analysis_context.get("cmap_name", self.cmap_name),
             "log_color": self.analysis_context.get("log_enabled", self.log_enabled),
         }
@@ -4721,7 +4758,7 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
                 "outlier_filtered_count": int(self.ridgeline_metadata.get("outlier_filtered_count", 0) or 0),
                 "polar_parameters": dict(self.ridgeline_metadata.get("polar_parameters", {}) or {}),
                 "snap_radius": int(self.snap_radius_spin.value()),
-                "slice_count": int(self.slice_count_spin.value()),
+                "ridge_min_rms": float(self.ridge_min_rms_spin.value()),
                 "trim_core_percent": float(self.trim_core_percent_spin.value()),
                 "trim_tail_percent": float(self.trim_tail_percent_spin.value()),
                 "ridgeline_smooth": int(self.ridge_smooth_spin.value()),
@@ -4810,6 +4847,12 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
 
     def _save_reconstruction_cache_sidecar(self, analysis_json_path: str) -> Dict[str, object]:
         cache_path = default_reconstruction_cache_path(analysis_json_path)
+        requested_transition_width = _safe_float(self.analysis_context.get("l0_l1_transition_requested_width_px", None))
+        requested_transition_width = (
+            float(requested_transition_width)
+            if np.isfinite(requested_transition_width) and requested_transition_width > 0.0
+            else None
+        )
         metadata = {
             "source": "ibae_level_map_reconstruction",
             "image_path": str(self.analysis_context.get("image_path", "") or ""),
@@ -4822,13 +4865,18 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             "custom_contour_values": self.analysis_context.get("custom_contour_values", None),
             "smooth_sigma_px": self.analysis_context.get("smooth_sigma_px", None),
             "l0_l1_transition_mode": self.analysis_context.get("l0_l1_transition_mode", "gaussian"),
-            "l0_l1_transition_width_px": self.analysis_context.get("l0_l1_transition_width_px", None),
+            "l0_l1_transition_requested_width_px": requested_transition_width,
+            "l0_l1_transition_width_px": requested_transition_width,
+            "l0_l1_transition_resolved_width_px": self.analysis_context.get("l0_l1_transition_resolved_width_px", None),
             "l0_l1_transition_width_source": self.analysis_context.get("l0_l1_transition_width_source", None),
             "l0_l1_transition_alpha": self.analysis_context.get("l0_l1_transition_alpha", 3.0),
             "l0_l1_transition_applied_pixel_count": self.analysis_context.get(
                 "l0_l1_transition_applied_pixel_count",
                 None,
             ),
+            "l0_l1_transition_local_width_median_px": self.analysis_context.get("l0_l1_transition_local_width_median_px", None),
+            "l0_l1_transition_local_width_min_px": self.analysis_context.get("l0_l1_transition_local_width_min_px", None),
+            "l0_l1_transition_local_width_max_px": self.analysis_context.get("l0_l1_transition_local_width_max_px", None),
             "cmap_name": str(self.cmap_name),
             "log_enabled": bool(self.log_enabled),
         }
@@ -4891,8 +4939,7 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
             }
             if ridgeline.get("snap_radius", None) is not None:
                 self.snap_radius_spin.setValue(int(ridgeline.get("snap_radius")))
-            if ridgeline.get("slice_count", None) is not None:
-                self.slice_count_spin.setValue(int(ridgeline.get("slice_count")))
+            self.ridge_min_rms_spin.setValue(_ridge_min_rms_from_payload(ridgeline))
             if ridgeline.get("trim_core_percent", None) is not None:
                 self.trim_core_percent_spin.setValue(float(ridgeline.get("trim_core_percent")))
             elif ridgeline.get("trim_percent", None) is not None:
@@ -5141,7 +5188,6 @@ class QtRidgelineAnalysisDialog(QDialog, _QtViewportMixin):
                 flux_map=self.flux_map,
                 support_mask=self.support_mask,
                 ridge_xy=self.ridge_xy,
-                n_slices=int(self.slice_count_spin.value()),
                 trim_start_frac=float(self.trim_core_percent_spin.value()) / 100.0,
                 trim_end_frac=float(self.trim_tail_percent_spin.value()) / 100.0,
                 tangent_half_window=None,
@@ -5670,7 +5716,7 @@ class QtFluxReconstructionDialog(QDialog):
         )
 
     def _l0_l1_transition_width_px(self) -> Optional[float]:
-        value = _safe_float(self.analysis_context.get("l0_l1_transition_width_px", None))
+        value = _safe_float(self.analysis_context.get("l0_l1_transition_requested_width_px", None))
         if np.isfinite(value) and value > 0.0:
             return float(value)
         return None
@@ -5775,7 +5821,9 @@ class QtFluxReconstructionDialog(QDialog):
                 "custom_contour_values": payload.get("custom_contour_values", None),
                 "smooth_sigma_px": payload.get("smooth_sigma_px", None),
                 "l0_l1_transition_mode": payload.get("l0_l1_transition_mode", self._l0_l1_transition_mode()),
+                "l0_l1_transition_requested_width_px": payload.get("l0_l1_transition_requested_width_px", None),
                 "l0_l1_transition_width_px": payload.get("l0_l1_transition_width_px", None),
+                "l0_l1_transition_resolved_width_px": payload.get("l0_l1_transition_resolved_width_px", None),
                 "l0_l1_transition_width_source": payload.get("l0_l1_transition_width_source", None),
                 "l0_l1_transition_alpha": payload.get(
                     "l0_l1_transition_alpha",
@@ -5910,6 +5958,10 @@ class QtFluxReconstructionDialog(QDialog):
                     float(expected_width),
                 ):
                     return False
+            else:
+                source = str(metadata.get("l0_l1_transition_width_source", ""))
+                if source != "local_l1_l2_thickness" and not source.startswith("local_fallback_"):
+                    return False
         return True
 
     def _seed_reconstruction_cache_from_arrays(
@@ -6010,9 +6062,16 @@ class QtFluxReconstructionDialog(QDialog):
             self.analysis_context["l0_l1_transition_mode"] = self._normalize_l0_l1_transition_mode(
                 flux_reconstruction.get("l0_l1_transition_mode", "gaussian")
             )
-            transition_width = _safe_float(flux_reconstruction.get("l0_l1_transition_width_px", None))
+            requested_transition_width = _requested_l0_l1_transition_width_from_payload(flux_reconstruction)
+            resolved_transition_width = _resolved_l0_l1_transition_width_from_payload(flux_reconstruction)
+            self.analysis_context["l0_l1_transition_requested_width_px"] = (
+                None if requested_transition_width is None else float(requested_transition_width)
+            )
             self.analysis_context["l0_l1_transition_width_px"] = (
-                float(transition_width) if np.isfinite(transition_width) and transition_width > 0.0 else None
+                None if requested_transition_width is None else float(requested_transition_width)
+            )
+            self.analysis_context["l0_l1_transition_resolved_width_px"] = (
+                None if resolved_transition_width is None else float(resolved_transition_width)
             )
             transition_alpha = _safe_float(flux_reconstruction.get("l0_l1_transition_alpha", 3.0), 3.0)
             self.analysis_context["l0_l1_transition_alpha"] = (
@@ -6250,6 +6309,8 @@ class QtFluxReconstructionDialog(QDialog):
         flux = np.asarray(rec["smoothed_flux_map"], dtype=np.float32)
         valid_u8 = np.asarray(rec["valid_mask"], dtype=np.uint8)
         transition_info = dict(rec.get("l0_l1_transition", {}) or {})
+        requested_transition_width = self._l0_l1_transition_width_px()
+        resolved_transition_width = _safe_float(transition_info.get("width_px", float("nan")))
         valid = valid_u8 > 0
         min_flux = float(rec["min_flux"])
         max_flux = float(rec["max_flux"])
@@ -6322,8 +6383,14 @@ class QtFluxReconstructionDialog(QDialog):
             "l0_l1_transition_mode": self._normalize_l0_l1_transition_mode(
                 transition_info.get("mode", self._l0_l1_transition_mode())
             ),
-            "l0_l1_transition_width_px": float(
-                _safe_float(transition_info.get("width_px", float("nan")))
+            "l0_l1_transition_requested_width_px": (
+                None if requested_transition_width is None else float(requested_transition_width)
+            ),
+            "l0_l1_transition_width_px": (
+                None if requested_transition_width is None else float(requested_transition_width)
+            ),
+            "l0_l1_transition_resolved_width_px": (
+                float(resolved_transition_width) if np.isfinite(resolved_transition_width) and resolved_transition_width > 0.0 else None
             ),
             "l0_l1_transition_width_source": str(transition_info.get("width_source", "")),
             "l0_l1_transition_alpha": float(
@@ -6334,6 +6401,15 @@ class QtFluxReconstructionDialog(QDialog):
             ),
             "l0_l1_transition_applied_pixel_count": int(
                 transition_info.get("applied_pixel_count", 0) or 0
+            ),
+            "l0_l1_transition_local_width_median_px": _safe_float(
+                transition_info.get("local_width_median_px", float("nan"))
+            ),
+            "l0_l1_transition_local_width_min_px": _safe_float(
+                transition_info.get("local_width_min_px", float("nan"))
+            ),
+            "l0_l1_transition_local_width_max_px": _safe_float(
+                transition_info.get("local_width_max_px", float("nan"))
             ),
             "cmap_name": str(cmap_name),
             "log_enabled": bool(self.log_color_check.isChecked()),

@@ -5,6 +5,8 @@ from .trends import (
     build_gaussian_report_rows,
     compute_local_k,
     find_opening_angle_plateau,
+    fit_intrinsic_conical_opening_from_rows,
+    fit_opening_angle_plateau_from_rows,
     fit_power_law_from_rows,
     paper_fig7_eastern_broken_power_law,
 )
@@ -14,6 +16,8 @@ __all__ = [
     "build_gaussian_report_rows",
     "compute_local_k",
     "find_opening_angle_plateau",
+    "fit_intrinsic_conical_opening_from_rows",
+    "fit_opening_angle_plateau_from_rows",
     "fit_power_law_from_rows",
     "paper_fig7_eastern_broken_power_law",
 ]

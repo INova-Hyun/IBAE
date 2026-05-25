@@ -16,6 +16,7 @@ from ..common.numeric import safe_float as _safe_float_common
 from ..common.numeric import unit_or_none as _unit_or_none_common
 
 Point = Tuple[int, int]
+GAUSSIAN_SOFT_L1_F_SCALE_FRACTION = 0.12
 
 
 def _safe_float(value: object, default: float = float("nan")) -> float:
@@ -1664,7 +1665,7 @@ def fit_transverse_gaussian(
 
     optimizer = "robust_least_squares"
     loss_name = "soft_l1"
-    loss_f_scale = float(max(1e-6, 0.10 * max(amp0, 1e-6)))
+    loss_f_scale = float(max(1e-6, GAUSSIAN_SOFT_L1_F_SCALE_FRACTION * max(amp0, 1e-6)))
 
     lower = np.array(
         [
@@ -2086,9 +2087,10 @@ def _pa_sweep_measurement_cache_key(
     digest.update(_hash_int_points(np.asarray(ridge_xy, dtype=np.int32)).encode("ascii"))
     digest.update(str(tuple(slices.tolist())).encode("ascii"))
     parts = [
-        "pa_sweep_v5",
+        "pa_sweep_v6",
         "fit_optimizer=robust_least_squares",
         "fit_loss=soft_l1",
+        f"fit_loss_f_scale_fraction={_cache_float(GAUSSIAN_SOFT_L1_F_SCALE_FRACTION)}",
         f"tangent={int(tangent_half_window)}",
         f"profile_step={_cache_float(profile_step_px)}",
         f"beam_px={_cache_float(beam_px)}",

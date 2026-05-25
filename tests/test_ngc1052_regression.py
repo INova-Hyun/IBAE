@@ -82,6 +82,7 @@ def _assert_scalar_close(name: str, actual: object, expected: object, *, atol: f
 
 def test_default_transverse_gaussian_baseline_is_fixed_zero():
     from IBAE.ridgeline import fit_transverse_gaussian
+    from IBAE.ridgeline.analysis import GAUSSIAN_SOFT_L1_F_SCALE_FRACTION
 
     x = np.linspace(-6.0, 6.0, 121)
     y = 0.2 + 3.0 * np.exp(-0.5 * (x / 1.25) ** 2)
@@ -94,6 +95,7 @@ def test_default_transverse_gaussian_baseline_is_fixed_zero():
     assert params["baseline_fixed"] is True
     assert fit["optimizer"] == "robust_least_squares"
     assert fit["loss"] == "soft_l1"
+    assert fit["loss_f_scale"] == pytest.approx(GAUSSIAN_SOFT_L1_F_SCALE_FRACTION * float(np.nanmax(y)))
 
 
 def test_legacy_transverse_gaussian_bounded_baseline_wrapper():
@@ -180,6 +182,77 @@ def test_gaussian_stability_flags_half_flux_width_disagreement():
     assert "fwhm_disagrees_with_half_flux_width" in stability["gaussian_unstable_reasons"]
 
 
+def _synthetic_conical_rows(theta_deg: float = 18.0, *, count: int = 28, outlier: bool = False) -> list[dict]:
+    distances = np.linspace(1.0, 12.0, count, dtype=np.float64)
+    theta_rad = np.radians(float(theta_deg))
+    widths = 2.0 * distances * np.tan(0.5 * theta_rad)
+    widths = widths * (1.0 + 0.012 * np.sin(np.arange(count, dtype=np.float64)))
+    if outlier and count > 12:
+        widths[count // 2] *= 1.85
+    sigmas = np.maximum(widths * 0.04, 1e-4)
+    rows = []
+    for idx, (distance, width, sigma) in enumerate(zip(distances.tolist(), widths.tolist(), sigmas.tolist()), start=1):
+        angle = float(2.0 * np.degrees(np.arctan(float(width) / (2.0 * float(distance)))))
+        angle_sigma = float((180.0 / np.pi) * abs(float(sigma) / (float(distance) * (1.0 + (float(width) / (2.0 * float(distance))) ** 2))))
+        rows.append(
+            {
+                "slice_order": idx,
+                "distance_from_core_mas": float(distance),
+                "gaussian_width_mas": float(width),
+                "gaussian_width_sigma_mas": float(sigma),
+                "gaussian_intrinsic_width_mas": float(width),
+                "gaussian_intrinsic_width_sigma_mas": float(sigma),
+                "gaussian_angle_deg": float(angle),
+                "gaussian_angle_sigma_deg": float(angle_sigma),
+            }
+        )
+    return rows
+
+
+def test_intrinsic_conical_fit_recovers_known_opening_with_outlier():
+    from IBAE.reports import fit_intrinsic_conical_opening_from_rows
+
+    result = fit_intrinsic_conical_opening_from_rows(_synthetic_conical_rows(18.0, outlier=True), distance_unit="mas")
+
+    assert result["opening_conical_fit_valid"] is True
+    assert result["opening_conical_loss"] == "soft_l1"
+    assert result["opening_conical_used_width_source"] == "intrinsic"
+    assert result["opening_conical_point_count"] == 28
+    assert result["opening_conical_fit_deg"] == pytest.approx(18.0, abs=0.7)
+
+
+def test_plateau_result_includes_auxiliary_intrinsic_conical_fit():
+    from IBAE.reports import find_opening_angle_plateau
+
+    result = find_opening_angle_plateau(_synthetic_conical_rows(22.0), distance_unit="mas", min_points=8)
+
+    assert result["fit_mode"] == "opening_plateau"
+    assert result["plateau_selection_mode"] == "auto_tail"
+    assert result["opening_conical_fit_valid"] is True
+    assert result["opening_conical_fit_deg"] == pytest.approx(22.0, abs=0.3)
+    assert abs(float(result["opening_conical_minus_plateau_median_deg"])) < 0.3
+
+
+def test_manual_plateau_fit_uses_requested_slice_range():
+    from IBAE.reports import fit_opening_angle_plateau_from_rows
+
+    rows = _synthetic_conical_rows(20.0, count=30)
+    result = fit_opening_angle_plateau_from_rows(
+        rows,
+        start_slice_order=7,
+        end_slice_order=21,
+        distance_unit="mas",
+        min_points=8,
+    )
+
+    assert result["fit_mode"] == "opening_plateau"
+    assert result["plateau_selection_mode"] == "manual_range"
+    assert result["plateau_start_slice_order"] == 7
+    assert result["plateau_end_slice_order"] == 21
+    assert result["opening_fit_median_deg"] == pytest.approx(20.0, abs=0.3)
+    assert result["opening_conical_fit_deg"] == pytest.approx(20.0, abs=0.3)
+
+
 def test_l0_l1_gaussian_transition_only_modifies_l0_band():
     pytest.importorskip("cv2")
 
@@ -223,6 +296,77 @@ def test_l0_l1_gaussian_transition_only_modifies_l0_band():
     legacy_target = np.asarray(legacy["target_flux_map"], dtype=np.float32)
     assert np.all(legacy_target[depth == 0] == 0.0)
     assert dict(legacy["l0_l1_transition"])["mode"] == "flat"
+
+
+def test_l0_l1_gaussian_transition_uses_local_l1_l2_thickness():
+    pytest.importorskip("cv2")
+
+    from IBAE.flux import reconstruct_flux_from_levels
+
+    depth = np.zeros((9, 24), dtype=np.int32)
+    roi = np.ones_like(depth, dtype=np.uint8)
+    depth[3:5, 2:10] = 1
+    depth[5:8, 2:10] = 2
+    depth[3:7, 10:22] = 1
+    depth[7:8, 10:22] = 2
+
+    result = reconstruct_flux_from_levels(
+        region_depth_map=depth,
+        roi_mask=roi,
+        background_flux=0.0,
+        l1_flux=10.0,
+        level_ratio=2.0,
+        smooth_sigma_px=0.0,
+        l0_l1_transition_mode="gaussian",
+    )
+    target = np.asarray(result["target_flux_map"], dtype=np.float32)
+    transition = dict(result["l0_l1_transition"])
+
+    assert transition["width_source"] == "local_l1_l2_thickness"
+    assert float(transition["local_width_max_px"]) > float(transition["local_width_min_px"])
+    assert target[0, 5] == pytest.approx(0.0)
+    assert target[0, 15] > 0.0
+
+
+def test_l0_l1_saved_resolved_width_does_not_reload_as_requested_width():
+    pytest.importorskip("PyQt5")
+
+    from IBAE.gui_v9_qt import (
+        _requested_l0_l1_transition_width_from_payload,
+        _resolved_l0_l1_transition_width_from_payload,
+    )
+
+    old_auto_payload = {
+        "l0_l1_transition_width_px": 43.55,
+        "l0_l1_transition_width_source": "median_l1_l2_spacing",
+    }
+    old_polluted_payload = {
+        "l0_l1_transition_width_px": 43.55,
+        "l0_l1_transition_width_source": "requested",
+    }
+    new_requested_payload = {
+        "l0_l1_transition_requested_width_px": 4.0,
+        "l0_l1_transition_width_px": 4.0,
+        "l0_l1_transition_resolved_width_px": 4.0,
+        "l0_l1_transition_width_source": "requested",
+    }
+
+    assert _requested_l0_l1_transition_width_from_payload(old_auto_payload) is None
+    assert _requested_l0_l1_transition_width_from_payload(old_polluted_payload) is None
+    assert _requested_l0_l1_transition_width_from_payload(new_requested_payload) == pytest.approx(4.0)
+    assert _resolved_l0_l1_transition_width_from_payload(old_auto_payload) == pytest.approx(43.55)
+
+
+def test_ridge_min_rms_payload_defaults_to_eight_and_ignores_legacy_slice_count():
+    pytest.importorskip("PyQt5")
+
+    from IBAE.gui_v9_qt import DEFAULT_RIDGE_MIN_RMS, _ridge_min_rms_from_payload
+
+    assert DEFAULT_RIDGE_MIN_RMS == pytest.approx(8.0)
+    assert _ridge_min_rms_from_payload({}) == pytest.approx(8.0)
+    assert _ridge_min_rms_from_payload({"slice_count": 25}) == pytest.approx(8.0)
+    assert _ridge_min_rms_from_payload({"ridge_min_rms": 12.5}) == pytest.approx(12.5)
+    assert _ridge_min_rms_from_payload({"ridge_min_rms": 0.0}) == pytest.approx(8.0)
 
 
 def test_width_profile_axis_values_do_not_fallback_to_px():
@@ -517,7 +661,7 @@ def test_ngc1052_flux_reconstruction_matches_cached_npz():
     from IBAE.flux import reconstruct_flux_from_levels
 
     flux_cfg = dict(payload["flux_reconstruction"])
-    transition_width = flux_cfg.get("l0_l1_transition_width_px", None)
+    transition_width = flux_cfg.get("l0_l1_transition_requested_width_px", None)
     transition_width_px = None
     if transition_width is not None:
         transition_width = float(transition_width)

@@ -232,10 +232,10 @@ def _truncated_gaussian_fade_values(
     background_flux: float,
     l1_flux: float,
     distance_px: np.ndarray,
-    width_px: float,
+    width_px: object,
     alpha: float,
 ) -> np.ndarray:
-    width = float(max(1e-6, width_px))
+    width = np.maximum(np.asarray(width_px, dtype=np.float32), np.float32(1e-6))
     alpha = float(max(1e-6, alpha))
     t = np.clip(np.asarray(distance_px, dtype=np.float32) / width, 0.0, 1.0)
     eps = float(np.exp(-0.5 * alpha * alpha))
@@ -243,6 +243,142 @@ def _truncated_gaussian_fade_values(
     fade = (np.exp(-0.5 * np.square(alpha * t)).astype(np.float32) - eps) / denom
     fade = np.clip(fade, 0.0, 1.0)
     return (float(background_flux) + ((float(l1_flux) - float(background_flux)) * fade)).astype(np.float32)
+
+
+def _distance_transform_with_pixel_labels(seed_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    seed = np.asarray(seed_mask, dtype=bool)
+    src = np.ones(seed.shape[:2], dtype=np.uint8)
+    src[seed] = 0
+    dist, labels = cv2.distanceTransformWithLabels(
+        src,
+        cv2.DIST_L2,
+        5,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    return dist.astype(np.float32), labels.astype(np.int32)
+
+
+def _median_by_int_label(labels: np.ndarray, values: np.ndarray) -> Dict[int, float]:
+    lab = np.asarray(labels, dtype=np.int32).reshape(-1)
+    val = np.asarray(values, dtype=np.float32).reshape(-1)
+    ok = (lab > 0) & np.isfinite(val) & (val > 0.0)
+    if not np.any(ok):
+        return {}
+    lab = lab[ok]
+    val = val[ok]
+    order = np.argsort(lab, kind="mergesort")
+    lab = lab[order]
+    val = val[order]
+    out: Dict[int, float] = {}
+    start = 0
+    n = int(lab.size)
+    while start < n:
+        label = int(lab[start])
+        end = start + 1
+        while end < n and int(lab[end]) == label:
+            end += 1
+        out[label] = float(np.nanmedian(val[start:end]))
+        start = end
+    return out
+
+
+def _local_l0_l1_width_map_from_l1_l2_thickness(
+    depth_map: np.ndarray,
+    valid_mask: np.ndarray,
+    l0_boundary: np.ndarray,
+    fallback_width_px: float,
+    fallback_width_source: str,
+) -> Dict[str, object]:
+    depth = np.asarray(depth_map, dtype=np.int32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    l0_boundary_mask = np.asarray(l0_boundary, dtype=bool)
+    fallback = float(max(1.0, fallback_width_px)) if np.isfinite(float(fallback_width_px)) else 1.0
+    width_map = np.full(depth.shape[:2], fallback, dtype=np.float32)
+    local_boundary_width = np.full(depth.shape[:2], np.nan, dtype=np.float32)
+    outer_region_mask = valid & (depth == 0)
+    l1_mask = valid & (depth == 1)
+    inner_region_mask = valid & (depth == 2)
+    if not np.any(l0_boundary_mask) or not np.any(l1_mask) or not np.any(inner_region_mask):
+        return {
+            "width_map": width_map,
+            "has_local": np.zeros(depth.shape[:2], dtype=bool),
+            "source": f"local_fallback_{fallback_width_source}",
+            "local_boundary_count": 0,
+            "fallback_boundary_count": int(np.count_nonzero(l0_boundary_mask)),
+            "local_width_values": np.zeros((0,), dtype=np.float32),
+        }
+
+    comp_count, comp_labels = cv2.connectedComponents(l1_mask.astype(np.uint8), connectivity=8)
+    for comp_id in range(1, int(comp_count)):
+        comp = comp_labels == comp_id
+        if not np.any(comp):
+            continue
+        outer_boundary_l1 = _boundary_pixels_inside_component(comp, outer_region_mask)
+        inner_boundary_l1 = _boundary_pixels_inside_component(comp, inner_region_mask)
+        if not np.any(outer_boundary_l1) or not np.any(inner_boundary_l1):
+            continue
+
+        dist_outer, labels_outer = _distance_transform_with_pixel_labels(outer_boundary_l1)
+        dist_inner = _distance_to_boundary(inner_boundary_l1, comp)
+        spacing = dist_outer + dist_inner
+        comp_ok = comp & np.isfinite(spacing) & (spacing > 0.0)
+        by_label = _median_by_int_label(labels_outer[comp_ok], spacing[comp_ok])
+        if not by_label:
+            continue
+
+        l0_for_comp = _boundary_pixels_inside_component(outer_region_mask, comp) & l0_boundary_mask
+        if not np.any(l0_for_comp):
+            continue
+        labels_l0 = labels_outer[l0_for_comp]
+        coords = np.flatnonzero(l0_for_comp.reshape(-1))
+        labels_flat = labels_l0.reshape(-1)
+        out_flat = local_boundary_width.reshape(-1)
+        for pos, label in zip(coords.tolist(), labels_flat.tolist()):
+            value = by_label.get(int(label))
+            if value is not None and np.isfinite(value) and value > 0.0:
+                out_flat[int(pos)] = np.float32(max(1.0, float(value)))
+
+    local_values = local_boundary_width[l0_boundary_mask & np.isfinite(local_boundary_width) & (local_boundary_width > 0.0)]
+    if local_values.size <= 0:
+        return {
+            "width_map": width_map,
+            "has_local": np.zeros(depth.shape[:2], dtype=bool),
+            "source": f"local_fallback_{fallback_width_source}",
+            "local_boundary_count": 0,
+            "fallback_boundary_count": int(np.count_nonzero(l0_boundary_mask)),
+            "local_width_values": np.zeros((0,), dtype=np.float32),
+        }
+
+    dist_l0, labels_l0 = _distance_transform_with_pixel_labels(l0_boundary_mask)
+    max_label = int(np.max(labels_l0)) if labels_l0.size else 0
+    if max_label <= 0:
+        return {
+            "width_map": width_map,
+            "has_local": np.zeros(depth.shape[:2], dtype=bool),
+            "source": f"local_fallback_{fallback_width_source}",
+            "local_boundary_count": int(local_values.size),
+            "fallback_boundary_count": int(np.count_nonzero(l0_boundary_mask) - local_values.size),
+            "local_width_values": local_values.astype(np.float32, copy=False),
+        }
+    label_width = np.full(max_label + 1, np.float32(fallback), dtype=np.float32)
+    label_has_local = np.zeros(max_label + 1, dtype=bool)
+    seed_labels = labels_l0[l0_boundary_mask]
+    seed_widths = local_boundary_width[l0_boundary_mask]
+    ok_seed = (seed_labels > 0) & np.isfinite(seed_widths) & (seed_widths > 0.0)
+    label_width[seed_labels[ok_seed]] = seed_widths[ok_seed].astype(np.float32, copy=False)
+    label_has_local[seed_labels[ok_seed]] = True
+    safe_labels = np.clip(labels_l0, 0, max_label)
+    width_map = label_width[safe_labels].astype(np.float32, copy=False)
+    has_local = label_has_local[safe_labels]
+    return {
+        "width_map": width_map,
+        "has_local": has_local,
+        "source": "local_l1_l2_thickness",
+        "local_boundary_count": int(np.count_nonzero(ok_seed)),
+        "fallback_boundary_count": int(np.count_nonzero(l0_boundary_mask) - np.count_nonzero(ok_seed)),
+        "local_width_values": local_values.astype(np.float32, copy=False),
+        "distance_map": dist_l0.astype(np.float32, copy=False),
+    }
 
 
 def _apply_l0_l1_gaussian_transition(
@@ -280,26 +416,50 @@ def _apply_l0_l1_gaussian_transition(
         info["width_source"] = "invalid_flux"
         return info
 
+    l0_boundary = _boundary_pixels_inside_component(outer_mask, l1_mask)
+    if not np.any(l0_boundary):
+        info["width_source"] = "missing_l0_l1_boundary"
+        return info
+
+    requested_width = _positive_float_or_nan(width_px)
+    use_requested_width = bool(np.isfinite(requested_width) and requested_width > 0.0)
     resolved_width, width_source = _resolve_l0_l1_transition_width_px(
         depth,
         valid,
-        width_px,
+        width_px if use_requested_width else None,
         smooth_sigma_px,
     )
     if not (np.isfinite(resolved_width) and resolved_width > 0.0):
         info["width_source"] = "invalid_width"
         return info
 
-    l0_boundary = _boundary_pixels_inside_component(outer_mask, l1_mask)
-    if not np.any(l0_boundary):
-        info["width_px"] = float(resolved_width)
-        info["width_source"] = "missing_l0_l1_boundary"
-        return info
-
     src = np.ones(depth.shape[:2], dtype=np.uint8)
     src[l0_boundary] = 0
     dist = cv2.distanceTransform(src, cv2.DIST_L2, 5).astype(np.float32)
-    transition = outer_mask & np.isfinite(dist) & (dist <= float(resolved_width))
+    width_values: object = float(resolved_width)
+    local_width_values = np.zeros((0,), dtype=np.float32)
+    local_boundary_count = 0
+    fallback_boundary_count = 0
+    local_fallback_pixel_count = 0
+    if not use_requested_width:
+        local = _local_l0_l1_width_map_from_l1_l2_thickness(
+            depth,
+            valid,
+            l0_boundary,
+            float(resolved_width),
+            str(width_source),
+        )
+        local_width_map = np.asarray(local.get("width_map", np.full(depth.shape[:2], resolved_width, dtype=np.float32)), dtype=np.float32)
+        local_has_width = np.asarray(local.get("has_local", np.zeros(depth.shape[:2], dtype=bool)), dtype=bool)
+        width_values = local_width_map
+        width_source = str(local.get("source", "local_l1_l2_thickness"))
+        local_width_values = np.asarray(local.get("local_width_values", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+        local_boundary_count = int(local.get("local_boundary_count", 0) or 0)
+        fallback_boundary_count = int(local.get("fallback_boundary_count", 0) or 0)
+        local_fallback_pixel_count = int(np.count_nonzero(outer_mask & np.isfinite(dist) & (~local_has_width)))
+        if local_width_values.size > 0:
+            resolved_width = float(np.nanmedian(local_width_values))
+    transition = outer_mask & np.isfinite(dist) & np.isfinite(width_values) & (dist <= width_values)
     if not np.any(transition):
         info["width_px"] = float(resolved_width)
         info["width_source"] = width_source
@@ -309,8 +469,13 @@ def _apply_l0_l1_gaussian_transition(
         float(background_flux),
         float(l1_flux),
         dist[transition],
-        float(resolved_width),
+        width_values[transition] if isinstance(width_values, np.ndarray) else float(resolved_width),
         float(alpha),
+    )
+    transition_width_values = (
+        width_values[transition]
+        if isinstance(width_values, np.ndarray)
+        else np.full((int(np.count_nonzero(transition)),), float(resolved_width), dtype=np.float32)
     )
     info.update(
         {
@@ -318,6 +483,13 @@ def _apply_l0_l1_gaussian_transition(
             "width_source": str(width_source),
             "alpha": float(alpha),
             "applied_pixel_count": int(np.count_nonzero(transition)),
+            "local_width_median_px": float(np.nanmedian(local_width_values)) if local_width_values.size > 0 else float("nan"),
+            "local_width_min_px": float(np.nanmin(local_width_values)) if local_width_values.size > 0 else float("nan"),
+            "local_width_max_px": float(np.nanmax(local_width_values)) if local_width_values.size > 0 else float("nan"),
+            "local_width_boundary_count": int(local_boundary_count),
+            "local_width_fallback_boundary_count": int(fallback_boundary_count),
+            "local_width_fallback_pixel_count": int(local_fallback_pixel_count),
+            "transition_width_median_px": float(np.nanmedian(transition_width_values)) if transition_width_values.size > 0 else float("nan"),
         }
     )
     return info

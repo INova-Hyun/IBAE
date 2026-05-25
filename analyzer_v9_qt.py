@@ -255,7 +255,7 @@ class JetAnalyzerV9Qt(JetAnalyzerV8Simple):
             expected_alpha = flux_rec.get("l0_l1_transition_alpha", 3.0)
             if not self._float_matches(metadata.get("l0_l1_transition_alpha", 3.0), expected_alpha):
                 return False
-            expected_width = flux_rec.get("l0_l1_transition_width_px", None)
+            expected_width = flux_rec.get("l0_l1_transition_requested_width_px", None)
             if expected_width is not None:
                 try:
                     expected_width_f = float(expected_width)
@@ -264,6 +264,10 @@ class JetAnalyzerV9Qt(JetAnalyzerV8Simple):
                 if np.isfinite(expected_width_f) and expected_width_f > 0.0:
                     if not self._float_matches(metadata.get("l0_l1_transition_width_px", None), expected_width_f):
                         return False
+            else:
+                source = str(metadata.get("l0_l1_transition_width_source", ""))
+                if source != "local_l1_l2_thickness" and not source.startswith("local_fallback_"):
+                    return False
         image_path = str(payload.get("image_path", "") or "")
         if image_path and bool(self._simple_replay_strict_image_match()):
             if not self._image_path_matches_or_moved_copy(image_path, self.image_path):

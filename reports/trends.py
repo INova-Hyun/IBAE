@@ -6,6 +6,7 @@ import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.optimize import least_squares
 
 from ..ridgeline.analysis import (
     _combine_independent_sigmas,
@@ -225,6 +226,153 @@ def compute_local_k(
             continue
         out[i] = float(slope)
     return out
+
+
+def _empty_conical_opening_fit(reason: str) -> Dict[str, object]:
+    return {
+        "opening_conical_fit_valid": False,
+        "opening_conical_fit_reason": str(reason),
+        "opening_conical_fit_deg": float("nan"),
+        "opening_conical_fit_sigma_deg": float("nan"),
+        "opening_conical_total_sigma_deg": float("nan"),
+        "opening_conical_residual_scatter_deg": float("nan"),
+        "opening_conical_data_median_sigma_deg": float("nan"),
+        "opening_conical_observed_median_deg": float("nan"),
+        "opening_conical_width_residual_scatter": float("nan"),
+        "opening_conical_reduced_chi2": float("nan"),
+        "opening_conical_robust_reduced_cost": float("nan"),
+        "opening_conical_robust_cost": float("nan"),
+        "opening_conical_point_count": 0,
+        "opening_conical_used_width_source": "intrinsic",
+        "opening_conical_used_weighted_fit": False,
+        "opening_conical_loss": "soft_l1",
+        "opening_conical_loss_f_scale": float("nan"),
+        "half_opening_conical_fit_deg": float("nan"),
+        "half_opening_conical_fit_sigma_deg": float("nan"),
+        "half_opening_conical_total_sigma_deg": float("nan"),
+    }
+
+
+def fit_intrinsic_conical_opening_from_rows(
+    rows: Sequence[Dict[str, object]],
+    *,
+    distance_unit: str = "auto",
+    min_points: int = 3,
+    loss: str = "soft_l1",
+    loss_f_scale: float = 1.0,
+) -> Dict[str, object]:
+    items = list(rows)
+    if not items:
+        return _empty_conical_opening_fit("no_rows")
+    distance_unit = str(distance_unit).strip().lower()
+    if distance_unit == "auto":
+        any_mas = any(np.isfinite(_safe_float(row.get("distance_from_core_mas", float("nan")))) for row in items)
+        distance_unit = "mas" if any_mas else "px"
+    x_key = "distance_from_core_mas" if distance_unit == "mas" else "distance_from_core_px"
+    width_key = "gaussian_intrinsic_width_mas" if distance_unit == "mas" else "gaussian_intrinsic_width_px"
+    sigma_key = "gaussian_intrinsic_width_sigma_mas" if distance_unit == "mas" else "gaussian_intrinsic_width_sigma_px"
+    x_all = np.asarray([_safe_float(row.get(x_key, float("nan"))) for row in items], dtype=np.float64)
+    width_all = np.asarray([_safe_float(row.get(width_key, float("nan"))) for row in items], dtype=np.float64)
+    sigma_all = np.asarray([_safe_float(row.get(sigma_key, float("nan"))) for row in items], dtype=np.float64)
+    valid = np.isfinite(x_all) & np.isfinite(width_all) & (x_all > 0.0) & (width_all > 0.0)
+    if int(np.count_nonzero(valid)) < int(max(3, min_points)):
+        return _empty_conical_opening_fit("not_enough_intrinsic_width_points")
+    x = x_all[valid]
+    width = width_all[valid]
+    sigma = sigma_all[valid]
+    weighted = bool(np.count_nonzero(np.isfinite(sigma) & (sigma > 0.0)) >= 3)
+    if weighted:
+        finite_sigma = np.isfinite(sigma) & (sigma > 0.0)
+        fallback_sigma = float(np.median(sigma[finite_sigma]))
+        sigma_eff = np.where(finite_sigma, sigma, fallback_sigma)
+    else:
+        sigma_eff = np.ones_like(width, dtype=np.float64)
+    sigma_eff = np.where(np.isfinite(sigma_eff) & (sigma_eff > 0.0), sigma_eff, 1.0)
+    theta_obs_rad = 2.0 * np.arctan(width / (2.0 * x))
+    theta_obs_deg = np.degrees(theta_obs_rad)
+    finite_theta = theta_obs_rad[np.isfinite(theta_obs_rad) & (theta_obs_rad > 0.0)]
+    if finite_theta.size <= 0:
+        return _empty_conical_opening_fit("invalid_intrinsic_opening_angles")
+    theta0 = float(np.median(finite_theta))
+    theta0 = float(np.clip(theta0, 1e-6, math.radians(179.0)))
+    f_scale = float(loss_f_scale)
+    if not (np.isfinite(f_scale) and f_scale > 0.0):
+        f_scale = 1.0
+
+    def residual(theta_arr: np.ndarray) -> np.ndarray:
+        theta = float(theta_arr[0])
+        model = 2.0 * x * np.tan(0.5 * theta)
+        return (width - model) / sigma_eff
+
+    try:
+        fit = least_squares(
+            residual,
+            x0=np.asarray([theta0], dtype=np.float64),
+            bounds=(np.asarray([1e-8], dtype=np.float64), np.asarray([math.radians(179.0)], dtype=np.float64)),
+            loss=str(loss),
+            f_scale=f_scale,
+            max_nfev=200,
+        )
+    except Exception as exc:
+        result = _empty_conical_opening_fit(f"fit_failed:{exc}")
+        result["opening_conical_loss_f_scale"] = float(f_scale)
+        return result
+    if not bool(fit.success) or fit.x.size <= 0 or not np.isfinite(float(fit.x[0])):
+        result = _empty_conical_opening_fit(str(getattr(fit, "message", "fit_failed")))
+        result["opening_conical_loss_f_scale"] = float(f_scale)
+        return result
+    theta_rad = float(fit.x[0])
+    theta_deg = float(np.degrees(theta_rad))
+    model_width = 2.0 * x * np.tan(0.5 * theta_rad)
+    width_resid = width - model_width
+    theta_resid = theta_obs_deg - theta_deg
+    point_count = int(width.size)
+    dof = max(1, point_count - 1)
+    raw_norm_resid = width_resid / sigma_eff
+    raw_chi2 = float(np.sum(np.square(raw_norm_resid[np.isfinite(raw_norm_resid)])))
+    reduced_chi2 = float(raw_chi2 / float(dof)) if dof > 0 else float("nan")
+    robust_reduced_cost = float((2.0 * float(fit.cost)) / float(dof)) if dof > 0 else float("nan")
+    jac = np.asarray(getattr(fit, "jac", np.empty((0, 0))), dtype=np.float64)
+    if jac.ndim == 2 and jac.shape[0] >= 1 and jac.shape[1] >= 1:
+        jtj = float(np.sum(np.square(jac[:, 0])))
+    else:
+        analytic_jac = -(x / sigma_eff) / (math.cos(0.5 * theta_rad) ** 2)
+        jtj = float(np.sum(np.square(analytic_jac[np.isfinite(analytic_jac)])))
+    if np.isfinite(jtj) and jtj > 0.0 and np.isfinite(robust_reduced_cost) and robust_reduced_cost >= 0.0:
+        theta_sigma_rad = math.sqrt(robust_reduced_cost / jtj)
+        theta_sigma_deg = float(np.degrees(theta_sigma_rad))
+    else:
+        theta_sigma_deg = float("nan")
+    theta_sigma_each = np.asarray(
+        [opening_angle_error_deg(float(w), float(r), float(s)) for w, r, s in zip(width.tolist(), x.tolist(), sigma_eff.tolist())],
+        dtype=np.float64,
+    )
+    theta_data_sigma = _median_propagated_sigma(theta_sigma_each)
+    theta_scatter = _robust_sigma(theta_resid)
+    theta_total_sigma = _combine_independent_sigmas(theta_sigma_deg, theta_scatter)
+    width_scatter = _robust_sigma(width_resid)
+    return {
+        "opening_conical_fit_valid": True,
+        "opening_conical_fit_reason": "ok",
+        "opening_conical_fit_deg": float(theta_deg),
+        "opening_conical_fit_sigma_deg": float(theta_sigma_deg),
+        "opening_conical_total_sigma_deg": float(theta_total_sigma),
+        "opening_conical_residual_scatter_deg": float(theta_scatter),
+        "opening_conical_data_median_sigma_deg": float(theta_data_sigma),
+        "opening_conical_observed_median_deg": float(np.median(theta_obs_deg[np.isfinite(theta_obs_deg)])),
+        "opening_conical_width_residual_scatter": float(width_scatter),
+        "opening_conical_reduced_chi2": float(reduced_chi2),
+        "opening_conical_robust_reduced_cost": float(robust_reduced_cost),
+        "opening_conical_robust_cost": float(fit.cost),
+        "opening_conical_point_count": int(point_count),
+        "opening_conical_used_width_source": "intrinsic",
+        "opening_conical_used_weighted_fit": bool(weighted),
+        "opening_conical_loss": str(loss),
+        "opening_conical_loss_f_scale": float(f_scale),
+        "half_opening_conical_fit_deg": float(0.5 * theta_deg),
+        "half_opening_conical_fit_sigma_deg": float(0.5 * theta_sigma_deg) if np.isfinite(theta_sigma_deg) else float("nan"),
+        "half_opening_conical_total_sigma_deg": float(0.5 * theta_total_sigma) if np.isfinite(theta_total_sigma) else float("nan"),
+    }
 
 
 def fit_power_law_from_rows(
@@ -567,8 +715,22 @@ def find_opening_angle_plateau(
     start_idx = int(valid_idx[0])
     end_idx = int(valid_idx[-1])
     x_center = float(np.exp(np.mean(np.log(fit_x)))) if fit_x.size > 0 else float("nan")
+    conical_fit = fit_intrinsic_conical_opening_from_rows(
+        [items[int(idx)] for idx in valid_idx.tolist()],
+        distance_unit=distance_unit,
+        min_points=max(3, min_points),
+        loss="soft_l1",
+        loss_f_scale=1.0,
+    )
+    conical_theta = _safe_float(conical_fit.get("opening_conical_fit_deg", float("nan")))
+    conical_fit["opening_conical_minus_plateau_median_deg"] = (
+        float(conical_theta - theta_level)
+        if np.isfinite(conical_theta) and np.isfinite(theta_level)
+        else float("nan")
+    )
     return {
         "fit_mode": "opening_plateau",
+        "plateau_selection_mode": "auto_tail",
         "distance_unit": str(distance_unit),
         "k_fit": float(meta["k_tail"]),
         "k_sigma": float(meta.get("k_tail_sigma", float("nan"))),
@@ -608,6 +770,192 @@ def find_opening_angle_plateau(
         "plateau_end_slice_order": int(items[end_idx].get("slice_order", end_idx + 1)),
         "plateau_start_distance": float(x_all[start_idx]),
         "plateau_end_distance": float(x_all[end_idx]),
+        **conical_fit,
+    }
+
+
+def fit_opening_angle_plateau_from_rows(
+    rows: Sequence[Dict[str, object]],
+    *,
+    start_slice_order: int,
+    end_slice_order: int,
+    distance_unit: str = "auto",
+    min_points: int = 8,
+    max_abs_theta_slope_deg_per_dex: float = 1.0,
+    k_tolerance: float = 0.30,
+) -> Dict[str, object]:
+    items = list(rows)
+    if not items:
+        raise ValueError("No report rows available for plateau fit.")
+    if int(end_slice_order) < int(start_slice_order):
+        raise ValueError("Plateau fit end slice must be >= start slice.")
+    distance_unit = str(distance_unit).strip().lower()
+    if distance_unit == "auto":
+        any_mas = any(np.isfinite(_safe_float(row.get("distance_from_core_mas", float("nan")))) for row in items)
+        distance_unit = "mas" if any_mas else "px"
+    x_key = "distance_from_core_mas" if distance_unit == "mas" else "distance_from_core_px"
+    y_key = "gaussian_width_mas" if distance_unit == "mas" else "gaussian_width_px"
+    y_sigma_key = "gaussian_width_sigma_mas" if distance_unit == "mas" else "gaussian_width_sigma_px"
+    x_all = np.asarray([_safe_float(row.get(x_key, float("nan"))) for row in items], dtype=np.float64)
+    width_all = np.asarray([_safe_float(row.get(y_key, float("nan"))) for row in items], dtype=np.float64)
+    width_sigma_all = np.asarray([_safe_float(row.get(y_sigma_key, float("nan"))) for row in items], dtype=np.float64)
+    theta_all = np.asarray([_safe_float(row.get("gaussian_angle_deg", float("nan"))) for row in items], dtype=np.float64)
+    theta_sigma_all = np.asarray([_safe_float(row.get("gaussian_angle_sigma_deg", float("nan"))) for row in items], dtype=np.float64)
+    selected_idx = np.asarray(
+        [
+            idx
+            for idx, row in enumerate(items)
+            if int(row.get("slice_order", idx + 1)) >= int(start_slice_order)
+            and int(row.get("slice_order", idx + 1)) <= int(end_slice_order)
+        ],
+        dtype=np.int64,
+    )
+    if selected_idx.size < int(max(3, min_points)):
+        raise ValueError("Not enough slices in selected plateau range.")
+    xs = x_all[selected_idx]
+    widths = width_all[selected_idx]
+    theta = theta_all[selected_idx]
+    valid = np.isfinite(xs) & np.isfinite(widths) & np.isfinite(theta) & (xs > 0.0) & (widths > 0.0) & (theta > 0.0)
+    if int(np.count_nonzero(valid)) < int(max(3, min_points)):
+        raise ValueError("Not enough valid slices in selected plateau range.")
+    valid_idx = selected_idx[valid]
+    xv = xs[valid]
+    wv = widths[valid]
+    tv = theta[valid]
+    width_sig_v = width_sigma_all[selected_idx][valid]
+    theta_sig_v = theta_sigma_all[selected_idx][valid]
+    lx = np.log10(xv)
+    if lx.size < 3 or np.allclose(lx, lx[0]):
+        raise ValueError("Selected plateau range has insufficient log-distance span.")
+    theta_level = float(np.median(tv))
+    theta_mean = float(np.mean(tv))
+    theta_resid = tv - theta_level
+    scatter = _robust_sigma(theta_resid)
+    if not np.isfinite(scatter):
+        scatter = 0.0 if theta_resid.size == 1 else float("nan")
+    theta_level_sigma = _median_propagated_sigma(theta_sig_v)
+    theta_total_sigma = _combine_independent_sigmas(scatter, theta_level_sigma)
+    theta_fit = _linear_fit_with_cov(lx, tv, theta_sig_v, min_points=3)
+    if theta_fit is None:
+        raise ValueError("Failed to fit theta slope in selected plateau range.")
+    theta_slope = float(theta_fit["slope"])
+    theta_intercept = float(theta_fit["intercept"])
+    theta_cov = np.asarray(theta_fit.get("cov", np.full((2, 2), np.nan)), dtype=np.float64)
+    theta_slope_sigma = float(math.sqrt(max(0.0, float(theta_cov[0, 0])))) if theta_cov.shape == (2, 2) and np.isfinite(theta_cov[0, 0]) else float("nan")
+    sigma_log_w = np.full(wv.shape, np.nan, dtype=np.float64)
+    finite_wsig = np.isfinite(width_sig_v) & (width_sig_v > 0.0) & np.isfinite(wv) & (wv > 0.0)
+    sigma_log_w[finite_wsig] = width_sig_v[finite_wsig] / (wv[finite_wsig] * np.log(10.0))
+    width_fit = _linear_fit_with_cov(lx, np.log10(wv), sigma_log_w, min_points=3)
+    if width_fit is not None:
+        k_tail = float(width_fit["slope"])
+        log_width_intercept = float(width_fit["intercept"])
+        width_cov = np.asarray(width_fit.get("cov", np.full((2, 2), np.nan)), dtype=np.float64)
+        k_tail_sigma = float(math.sqrt(max(0.0, float(width_cov[0, 0])))) if width_cov.shape == (2, 2) and np.isfinite(width_cov[0, 0]) else float("nan")
+        log_width_intercept_sigma = float(math.sqrt(max(0.0, float(width_cov[1, 1])))) if width_cov.shape == (2, 2) and np.isfinite(width_cov[1, 1]) else float("nan")
+    else:
+        k_tail = float("nan")
+        log_width_intercept = float("nan")
+        k_tail_sigma = float("nan")
+        log_width_intercept_sigma = float("nan")
+    used_weighted_fit = bool(theta_fit.get("used_weighted", False)) or bool(width_fit.get("used_weighted", False) if width_fit is not None else False)
+    log_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
+    max_abs_theta_slope_deg_per_dex = float(max(1e-9, max_abs_theta_slope_deg_per_dex))
+    k_tolerance = float(max(1e-9, k_tolerance))
+    slope_penalty = abs(theta_slope) / max_abs_theta_slope_deg_per_dex
+    k_penalty = abs(k_tail - 1.0) / k_tolerance if np.isfinite(k_tail) else 1e6
+    scatter_penalty = theta_total_sigma / max(1.0, abs(theta_level))
+    pass_count = int(abs(theta_slope) > max_abs_theta_slope_deg_per_dex) + int(
+        np.isfinite(k_tail) and abs(k_tail - 1.0) > k_tolerance
+    )
+    score = float(slope_penalty + (0.50 * k_penalty) + (0.25 * scatter_penalty) - (0.05 * log_span))
+    theta_rad = np.radians(theta_level)
+    model_width = np.full(x_all.shape, np.nan, dtype=np.float64)
+    positive_x = np.isfinite(x_all) & (x_all > 0.0) & np.isfinite(theta_rad) & (theta_rad > 0.0)
+    model_width[positive_x] = 2.0 * x_all[positive_x] * np.tan(0.5 * theta_rad)
+    width_model_sigma = np.full(x_all.shape, np.nan, dtype=np.float64)
+    log_width_model_sigma = np.full(x_all.shape, np.nan, dtype=np.float64)
+    if np.isfinite(theta_level_sigma) and theta_level_sigma >= 0.0 and np.isfinite(theta_rad) and theta_rad > 0.0:
+        sec2 = 1.0 / (math.cos(0.5 * theta_rad) ** 2)
+        width_model_sigma[positive_x] = np.abs(x_all[positive_x] * sec2 * (math.pi / 180.0) * theta_level_sigma)
+        finite_model_sigma = positive_x & np.isfinite(width_model_sigma) & np.isfinite(model_width) & (model_width > 0.0)
+        log_width_model_sigma[finite_model_sigma] = width_model_sigma[finite_model_sigma] / (model_width[finite_model_sigma] * math.log(10.0))
+    opening_model = np.full(x_all.shape, np.nan, dtype=np.float64)
+    opening_model[positive_x] = theta_level
+    opening_model_sigma = np.full(x_all.shape, np.nan, dtype=np.float64)
+    opening_model_sigma[positive_x] = theta_level_sigma
+    opening_residual = np.full(x_all.shape, np.nan, dtype=np.float64)
+    resid_valid = np.isfinite(theta_all) & np.isfinite(opening_model) & (theta_all > 0.0)
+    opening_residual[resid_valid] = theta_all[resid_valid] - opening_model[resid_valid]
+    log_width_residual = np.full(x_all.shape, np.nan, dtype=np.float64)
+    width_resid_valid = np.isfinite(width_all) & np.isfinite(model_width) & (width_all > 0.0) & (model_width > 0.0)
+    log_width_residual[width_resid_valid] = np.log10(width_all[width_resid_valid]) - np.log10(model_width[width_resid_valid])
+    log_width_residual_scatter = (
+        _robust_sigma(log_width_residual[valid_idx])
+        if np.any(np.isfinite(log_width_residual[valid_idx]))
+        else float("nan")
+    )
+    log_width_fit_median_sigma = _median_propagated_sigma(log_width_model_sigma[valid_idx])
+    log_width_sigma = _combine_independent_sigmas(log_width_residual_scatter, log_width_fit_median_sigma)
+    fit_x = x_all[valid_idx]
+    start_idx = int(valid_idx[0])
+    end_idx = int(valid_idx[-1])
+    x_center = float(np.exp(np.mean(np.log(fit_x)))) if fit_x.size > 0 else float("nan")
+    conical_fit = fit_intrinsic_conical_opening_from_rows(
+        [items[int(idx)] for idx in valid_idx.tolist()],
+        distance_unit=distance_unit,
+        min_points=max(3, min_points),
+        loss="soft_l1",
+        loss_f_scale=1.0,
+    )
+    conical_theta = _safe_float(conical_fit.get("opening_conical_fit_deg", float("nan")))
+    conical_fit["opening_conical_minus_plateau_median_deg"] = (
+        float(conical_theta - theta_level)
+        if np.isfinite(conical_theta) and np.isfinite(theta_level)
+        else float("nan")
+    )
+    return {
+        "fit_mode": "opening_plateau",
+        "plateau_selection_mode": "manual_range",
+        "distance_unit": str(distance_unit),
+        "k_fit": float(k_tail),
+        "k_sigma": float(k_tail_sigma),
+        "intercept_log10": float(log_width_intercept),
+        "intercept_log10_sigma": float(log_width_intercept_sigma),
+        "x_all": x_all.astype(np.float32),
+        "width_model": model_width.astype(np.float32),
+        "width_model_sigma": width_model_sigma.astype(np.float32),
+        "log_width_model_sigma_dex": log_width_model_sigma.astype(np.float32),
+        "log_width_residual_all": log_width_residual.astype(np.float32),
+        "log_width_sigma_dex": float(log_width_sigma),
+        "log_width_residual_scatter_dex": float(log_width_residual_scatter),
+        "log_width_fit_median_sigma_dex": float(log_width_fit_median_sigma),
+        "used_weighted_fit": bool(used_weighted_fit),
+        "opening_model_deg": opening_model.astype(np.float32),
+        "opening_model_sigma_deg": opening_model_sigma.astype(np.float32),
+        "opening_residual_all": opening_residual.astype(np.float32),
+        "opening_sigma_deg": float(theta_total_sigma),
+        "opening_residual_scatter_deg": float(scatter),
+        "opening_data_median_sigma_deg": float(theta_level_sigma),
+        "opening_fit_median_deg": float(theta_level),
+        "opening_fit_median_sigma_deg": float(theta_level_sigma),
+        "half_opening_fit_median_deg": float(0.5 * theta_level),
+        "half_opening_fit_median_sigma_deg": float(0.5 * theta_level_sigma) if np.isfinite(theta_level_sigma) else float("nan"),
+        "opening_fit_mean_deg": float(theta_mean),
+        "opening_fit_center_deg": float(theta_level),
+        "opening_fit_center_sigma_deg": float(theta_level_sigma),
+        "opening_fit_center_distance": float(x_center),
+        "theta_slope_deg_per_dex": float(theta_slope),
+        "theta_slope_sigma_deg_per_dex": float(theta_slope_sigma),
+        "theta_intercept_deg": float(theta_intercept),
+        "plateau_score": float(score),
+        "plateau_passes_thresholds": bool(pass_count == 0),
+        "plateau_point_count": int(valid_idx.size),
+        "plateau_log_span": float(log_span),
+        "plateau_start_slice_order": int(items[start_idx].get("slice_order", start_idx + 1)),
+        "plateau_end_slice_order": int(items[end_idx].get("slice_order", end_idx + 1)),
+        "plateau_start_distance": float(x_all[start_idx]),
+        "plateau_end_distance": float(x_all[end_idx]),
+        **conical_fit,
     }
 
 
@@ -786,6 +1134,8 @@ __all__ = [
     "build_gaussian_report_rows",
     "compute_local_k",
     "find_opening_angle_plateau",
+    "fit_intrinsic_conical_opening_from_rows",
+    "fit_opening_angle_plateau_from_rows",
     "fit_power_law_from_rows",
     "paper_fig7_eastern_broken_power_law",
 ]
